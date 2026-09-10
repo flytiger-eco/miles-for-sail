@@ -1,0 +1,523 @@
+Adds a weight-update session API for quantized rollout engines.
+begin_weight_update restores in-place-packed weights (e.g. Marlin-repacked)
+to a loadable state before new weights arrive; end_weight_update optionally
+runs post_load_weights (when load_weights was bypassed, e.g. P2P/RDMA) and
+finalizes quantized weights back into kernel layout. Exposed as HTTP
+endpoints and wired through tokenizer manager, scheduler, weight updater,
+and model runner, with a {target, draft, all} selector so the draft model
+is prepared identically to the target. Also implements iter_runners() on
+the 5 speculative workers so draft runners are included under speculative
+decoding.
+
+---
+ sglang/srt/entrypoints/http_server.py         | 28 +++++++
+ sglang/srt/managers/io_struct.py              | 25 ++++++
+ sglang/srt/managers/scheduler.py              | 10 +++
+ .../scheduler_components/weight_updater.py    | 79 ++++++++++++++++++-
+ .../srt/managers/tokenizer_control_mixin.py   | 44 +++++++++++
+ sglang/srt/managers/tp_worker.py              | 13 +++
+ sglang/srt/model_executor/model_runner.py     | 21 ++++-
+ sglang/srt/model_loader/loader.py             | 35 ++++++++
+ sglang/srt/speculative/dflash_worker.py       |  5 +++++
+ sglang/srt/speculative/eagle_worker_v2.py     |  3 +++
+ sglang/srt/speculative/frozen_kv_mtp_worker.py|  3 +++
+ .../speculative/multi_layer_eagle_worker_v2.py|  3 +++
+ sglang/srt/speculative/ngram_worker.py        |  5 +++++
+ 13 files changed, 272 insertions(+), 2 deletions(-)
+
+diff --git a/sglang/srt/entrypoints/http_server.py b/sglang/srt/entrypoints/http_server.py
+index d736838..b64824a 100644
+--- a/sglang/srt/entrypoints/http_server.py
++++ b/sglang/srt/entrypoints/http_server.py
+@@ -138,6 +138,8 @@ from sglang.srt.managers.io_struct import (
+     UpdateWeightFromDiskReqInput,
+     UpdateWeightsFromDistributedReqInput,
+     UpdateWeightsFromIPCReqInput,
++    BeginWeightUpdateReqInput,
++    EndWeightUpdateReqInput,
+     UpdateWeightsFromTensorReqInput,
+     UpdateWeightVersionReqInput,
+     VertexGenerateReqInput,
+@@ -1249,6 +1251,32 @@ async def update_weights_from_ipc(obj: UpdateWeightsFromIPCReqInput, request: Re
+         return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+ 
+ 
++@app.post("/begin_weight_update")
++async def begin_weight_update(req: BeginWeightUpdateReqInput, request: Request):
++    """Open a weight-update session on all rollout engines (restore packed weights)."""
++    success, message = await _global_state.tokenizer_manager.begin_weight_update(
++        req, request
++    )
++
++    content = {"success": success, "message": message}
++    return ORJSONResponse(
++        content, status_code=200 if success else HTTPStatus.BAD_REQUEST
++    )
++
++
++@app.post("/end_weight_update")
++async def end_weight_update(req: EndWeightUpdateReqInput, request: Request):
++    """End the weight update session: optionally post_load_weights, then quant finalize."""
++    success, message = await _global_state.tokenizer_manager.end_weight_update(
++        req, request
++    )
++
++    content = {"success": success, "message": message}
++    return ORJSONResponse(
++        content, status_code=200 if success else HTTPStatus.BAD_REQUEST
++    )
++
++
+ @app.post("/update_weight_version")
+ @auth_level(AuthLevel.ADMIN_OPTIONAL)
+ async def update_weight_version(obj: UpdateWeightVersionReqInput, request: Request):
+diff --git a/sglang/srt/managers/io_struct.py b/sglang/srt/managers/io_struct.py
+index 987ec51..3d4377f 100644
+--- a/sglang/srt/managers/io_struct.py
++++ b/sglang/srt/managers/io_struct.py
+@@ -1472,6 +1472,31 @@ class UpdateWeightFromDiskReqOutput(BaseReq):
+     num_paused_requests: Optional[int] = 0
+ 
+ 
++@dataclass
++class BeginWeightUpdateReqInput(BaseReq):
++    # Which model runners this update session covers: "target" (main model only),
++    # "draft" (draft worker(s) only), or "all" (default). The selector is fixed for
++    # the whole begin -> update -> end session; end finalizes the same set.
++    selector: Literal["target", "draft", "all"] = "all"
++
++
++@dataclass
++class BeginWeightUpdateReqOutput(BaseReq):
++    success: bool
++    message: str
++
++
++@dataclass
++class EndWeightUpdateReqInput(BaseReq):
++    pass
++
++
++@dataclass
++class EndWeightUpdateReqOutput(BaseReq):
++    success: bool
++    message: str
++
++
+ @dataclass
+ class UpdateWeightsFromDistributedReqInput(BaseReq):
+     names: List[str]
+diff --git a/sglang/srt/managers/scheduler.py b/sglang/srt/managers/scheduler.py
+index 377b360..ec5af8c 100644
+--- a/sglang/srt/managers/scheduler.py
++++ b/sglang/srt/managers/scheduler.py
+@@ -92,6 +92,8 @@ from sglang.srt.managers.io_struct import (
+     AttachHiCacheStorageReqOutput,
+     BatchTokenizedEmbeddingReqInput,
+     BatchTokenizedGenerateReqInput,
++    BeginWeightUpdateReqInput,
++    EndWeightUpdateReqInput,
+     CheckWeightsReqInput,
+     ClearHiCacheReqInput,
+     ClearHiCacheReqOutput,
+@@ -1334,6 +1336,14 @@ class Scheduler(
+                     CheckWeightsReqInput,
+                     self.weight_updater.check_weights,
+                 ),
++                (
++                    BeginWeightUpdateReqInput,
++                    self.weight_updater.begin_weight_update,
++                ),
++                (
++                    EndWeightUpdateReqInput,
++                    self.weight_updater.end_weight_update,
++                ),
+                 (SlowDownReqInput, self.slow_down),
+                 (
+                     ProfileReq,
+diff --git a/sglang/srt/managers/scheduler_components/weight_updater.py b/sglang/srt/managers/scheduler_components/weight_updater.py
+index 77bf823..3508e3f 100644
+--- a/sglang/srt/managers/scheduler_components/weight_updater.py
++++ b/sglang/srt/managers/scheduler_components/weight_updater.py
+@@ -6,7 +6,7 @@ import time
+ import traceback
+ from contextlib import contextmanager
+ from dataclasses import dataclass, field
+-from typing import Any, Callable, Dict, Iterator, Optional, Tuple
++from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
+ 
+ import torch
+ 
+@@ -17,6 +17,10 @@ from sglang.srt.constants import (
+     GPU_MEMORY_TYPE_WEIGHTS,
+ )
+ from sglang.srt.managers.io_struct import (
++    BeginWeightUpdateReqInput,
++    BeginWeightUpdateReqOutput,
++    EndWeightUpdateReqInput,
++    EndWeightUpdateReqOutput,
+     CheckWeightsReqInput,
+     CheckWeightsReqOutput,
+     DestroyWeightsUpdateGroupReqInput,
+@@ -69,6 +73,17 @@ def _merge_checksum_payloads(target: Dict, draft: Dict) -> Dict:
+     return target
+ 
+ 
++def _parse_runner_selector(selector: str) -> Set[str]:
++    """Map a {target, draft, all} weight-op selector to the set of roles it covers."""
++    if selector == "all":
++        return {"target", "draft"}
++    if selector in ("target", "draft"):
++        return {selector}
++    raise ValueError(
++        f"invalid selector {selector!r}; expected 'target', 'draft', or 'all'"
++    )
++
++
+ @dataclass(kw_only=True, slots=True)
+ class SchedulerWeightUpdaterManager:
+     tp_worker: Any
+@@ -80,6 +95,11 @@ class SchedulerWeightUpdaterManager:
+     metrics_collector: Optional[Any] = None
+     offload_tags: set = field(default_factory=set)
+     stashed_model_static_state: Any = None
++    _weight_update_in_progress: bool = False
++    _weight_update_loaded: bool = False
++    # Runner selector for the open session, recorded at begin_weight_update and
++    # reused by end_weight_update so the same set is restored and finalized.
++    _weight_update_selector: str = "all"
+ 
+     @contextmanager
+     def _observe_weight_load(self, source: str) -> Iterator[None]:
+@@ -129,6 +149,31 @@ class SchedulerWeightUpdaterManager:
+         success, message = self.tp_worker.destroy_weights_update_group(recv_req)
+         return DestroyWeightsUpdateGroupReqOutput(success, message)
+ 
++    def iter_weight_update_workers(
++        self, selector: str = "all"
++    ) -> List[Tuple[str, Any]]:
++        """Resolve a {target, draft, all} selector to (role, worker) pairs, target
++        first: the target worker and, when present, the draft worker. This is the
++        worker-level inclusion decision; each worker then contributes its own runners
++        via iter_runners()."""
++        parsed = _parse_runner_selector(selector)
++        workers: List[Tuple[str, Any]] = []
++        if "target" in parsed:
++            workers.append(("target", self.tp_worker))
++        if "draft" in parsed and self.draft_worker is not None:
++            workers.append(("draft", self.draft_worker))
++        return workers
++
++    def get_model_runners(self, selector: str = "all") -> List[Tuple[str, Any]]:
++        """Resolve a {target, draft, all} selector to (role, ModelRunner) pairs, target
++        first. Derived from iter_weight_update_workers: each selected worker yields its
++        own runners via iter_runners() — role "" for the target runner, draft roles
++        from the draft worker."""
++        runners: List[Tuple[str, Any]] = []
++        for _, worker in self.iter_weight_update_workers(selector):
++            runners += worker.iter_runners()
++        return runners
++
+     def update_weights_from_distributed(
+         self,
+         recv_req: UpdateWeightsFromDistributedReqInput,
+@@ -137,6 +182,7 @@ class SchedulerWeightUpdaterManager:
+         with self._observe_weight_load("distributed"):
+             success, message = self.tp_worker.update_weights_from_distributed(recv_req)
+             if success:
++                self._weight_update_loaded = True
+                 self.flush_cache_after_weight_update(recv_req)
+             else:
+                 logger.error(message)
+@@ -175,6 +221,37 @@ class SchedulerWeightUpdaterManager:
+         parameter = self.tp_worker.get_weights_by_name(recv_req)
+         return GetWeightsByNameReqOutput(parameter)
+ 
++    def begin_weight_update(self, recv_req: BeginWeightUpdateReqInput):
++        """Begin a weight-update session: restore in-place-packed weights to a
++        loadable state on the selected runners (target and/or draft), so the draft
++        model is prepared identically to the target. The selector is recorded and
++        reused by end_weight_update so the same set is finalized."""
++        assert (
++            not self._weight_update_in_progress
++        ), "begin_weight_update called while a weight-update session is already open"
++        self._weight_update_selector = recv_req.selector
++        for _, runner in self.get_model_runners(recv_req.selector):
++            runner.begin_weight_update()
++        self._weight_update_in_progress = True
++        self._weight_update_loaded = False
++        torch.distributed.barrier(group=self.tp_cpu_group)
++        return BeginWeightUpdateReqOutput(True, "Success")
++
++    def end_weight_update(self, recv_req: EndWeightUpdateReqInput):
++        """End the weight-update session on the runners begin_weight_update opened
++        (its recorded selector): quant finalize on each, plus model.post_load_weights
++        only when load_weights was bypassed this session (e.g. P2P/RDMA).
++        """
++        assert (
++            self._weight_update_in_progress
++        ), "end_weight_update called without begin_weight_update"
++        run_post_load = not self._weight_update_loaded
++        for _, runner in self.get_model_runners(self._weight_update_selector):
++            runner.end_weight_update(run_post_load=run_post_load)
++        self._weight_update_in_progress = False
++        torch.distributed.barrier(group=self.tp_cpu_group)
++        return EndWeightUpdateReqOutput(True, "Success")
++
+     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
+         assert (
+             self.is_fully_idle()
+diff --git a/sglang/srt/managers/tokenizer_control_mixin.py b/sglang/srt/managers/tokenizer_control_mixin.py
+index c9939a1..05e7d3f 100644
+--- a/sglang/srt/managers/tokenizer_control_mixin.py
++++ b/sglang/srt/managers/tokenizer_control_mixin.py
+@@ -15,6 +15,10 @@ from sglang.srt.managers.io_struct import (
+     AddExternalCorpusReqOutput,
+     AttachHiCacheStorageReqInput,
+     AttachHiCacheStorageReqOutput,
++    BeginWeightUpdateReqInput,
++    BeginWeightUpdateReqOutput,
++    EndWeightUpdateReqInput,
++    EndWeightUpdateReqOutput,
+     CheckWeightsReqInput,
+     CheckWeightsReqOutput,
+     ClearHiCacheReqInput,
+@@ -96,6 +100,8 @@ _COMMUNICATOR_SPECS = [
+     ("send_weights_to_remote_instance", SendWeightsToRemoteInstanceReqOutput),
+     ("update_weights_from_tensor", UpdateWeightsFromTensorReqOutput),
+     ("update_weights_from_ipc", UpdateWeightsFromIPCReqOutput),
++    ("begin_weight_update", BeginWeightUpdateReqOutput),
++    ("end_weight_update", EndWeightUpdateReqOutput),
+     ("get_weights_by_name", GetWeightsByNameReqOutput),
+     ("release_memory_occupation", ReleaseMemoryOccupationReqOutput),
+     ("resume_memory_occupation", ResumeMemoryOccupationReqOutput),
+@@ -403,6 +409,44 @@ class TokenizerControlMixin:
+         results = await self.destroy_weights_update_group_communicator(obj)
+         return FanOutCommunicator.merge_results(results)
+ 
++    async def begin_weight_update(
++        self: TokenizerManager,
++        obj: BeginWeightUpdateReqInput,
++        request: Optional[fastapi.Request] = None,
++    ) -> Tuple[bool, str]:
++        """Begin a new weight update session: restore packed weights to a loadable state."""
++        self.auto_create_handle_loop()
++
++        async with self.is_pause_cond:
++            is_paused = self.is_pause
++            if is_paused:
++                results = await self.begin_weight_update_communicator(obj)
++
++        if not is_paused:
++            async with self.model_update_lock.writer_lock:
++                results = await self.begin_weight_update_communicator(obj)
++
++        return FanOutCommunicator.merge_results(results)
++
++    async def end_weight_update(
++        self: TokenizerManager,
++        obj: EndWeightUpdateReqInput,
++        request: Optional[fastapi.Request] = None,
++    ) -> Tuple[bool, str]:
++        """End the weight update session: optionally post_load_weights, then quant finalize."""
++        self.auto_create_handle_loop()
++
++        async with self.is_pause_cond:
++            is_paused = self.is_pause
++            if is_paused:
++                results = await self.end_weight_update_communicator(obj)
++
++        if not is_paused:
++            async with self.model_update_lock.writer_lock:
++                results = await self.end_weight_update_communicator(obj)
++
++        return FanOutCommunicator.merge_results(results)
++
+     async def update_weights_from_distributed(
+         self: TokenizerManager,
+         obj: UpdateWeightsFromDistributedReqInput,
+diff --git a/sglang/srt/managers/tp_worker.py b/sglang/srt/managers/tp_worker.py
+index bd91844..d9dba6b 100644
+--- a/sglang/srt/managers/tp_worker.py
++++ b/sglang/srt/managers/tp_worker.py
+@@ -403,6 +403,19 @@ class TpModelWorker(BaseTpWorker):
+     def model_runner(self) -> "ModelRunner":
+         return self._model_runner
+ 
++    def iter_runners(self) -> List[Tuple[str, "ModelRunner"]]:
++        # All (role, ModelRunner) pairs this worker contributes to a weight update.
++        # The target (is_draft_worker=False) yields its own runner under the empty
++        # role; a draft worker yields its draft runner(s).
++        if not self.is_draft_worker:
++            return [("", self.model_runner)]
++        model_runner_list = getattr(self, "model_runner_list", None)
++        if model_runner_list:
++            return [
++                (f"draft_step_{i}", r) for i, r in enumerate(model_runner_list)
++            ]
++        return [("draft", self.model_runner)]
++
+     def register_hicache_layer_transfer_counter(self, counter: LayerDoneCounter):
+         self.hicache_layer_transfer_counter = counter
+ 
+diff --git a/sglang/srt/model_executor/model_runner.py b/sglang/srt/model_executor/model_runner.py
+index a46b553..567680d 100644
+--- a/sglang/srt/model_executor/model_runner.py
++++ b/sglang/srt/model_executor/model_runner.py
+@@ -188,7 +188,13 @@ from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
+     PiecewiseCudaGraphRunner,
+ )
+ from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
+-from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
++from sglang.srt.model_loader.loader import (
++    DefaultModelLoader,
++    get_model_loader,
++    post_load_weights,
++    postprocess_weight,
++    restore_weight,
++)
+ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
+     RemoteInstanceWeightLoaderBackend,
+     register_memory_region,
+@@ -1998,6 +2004,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+             logger.error(message)
+             return False, message
+ 
++    def begin_weight_update(self) -> None:
++        """Begin a weight-update session: restore in-place-packed weights to a
++        loadable state (no-op for schemes that don't repack)."""
++        restore_weight(self.model, torch.device(self.device))
++
++    def end_weight_update(self, run_post_load: bool) -> None:
++        """End the weight-update session: optionally run model.post_load_weights
++        (when load_weights was bypassed this session, e.g. P2P/RDMA), then finalize
++        quantized weights into kernel layout."""
++        if run_post_load:
++            post_load_weights(self.model)
++        postprocess_weight(self.model, torch.device(self.device))
++
+     def update_weights_from_distributed(
+         self,
+         names,
+diff --git a/sglang/srt/model_loader/loader.py b/sglang/srt/model_loader/loader.py
+index 32ff5ba..6db6d86 100644
+--- a/sglang/srt/model_loader/loader.py
++++ b/sglang/srt/model_loader/loader.py
+@@ -305,6 +305,41 @@ def _post_load_weights(model: nn.Module) -> None:
+         model.post_load_weights()
+ 
+ 
++post_load_weights = _post_load_weights
++"""Public alias: loaders that bypass `model.load_weights()` must trigger the
++model's post-load fixup explicitly (r12 renames _post_load_weights; we alias)."""
++
++
++def _apply_quant_method_hook(model: nn.Module, target_device, hook_name: str) -> None:
++    """Run a quant_method hook (restore/process) on every quantized module.
++
++    LoRA wrappers forward `quant_method` for forward-path dispatch but don't own
++    the packed params; skip them so the inner base layer (yielded separately by
++    `named_modules`) handles it.
++    """
++    from sglang.srt.lora.layers import BaseLayerWithLoRA
++
++    for _, module in model.named_modules():
++        if isinstance(module, BaseLayerWithLoRA):
++            continue
++        quant_method = getattr(module, "quant_method", None)
++        if quant_method is not None and hasattr(quant_method, hook_name):
++            with device_loading_context(module, target_device):
++                getattr(quant_method, hook_name)(module)
++
++
++def restore_weight(model: nn.Module, target_device) -> None:
++    """Undo in-place quant packing so fresh weights can be loaded
++    (no-op for schemes that don't repack, e.g. plain fp8)."""
++    _apply_quant_method_hook(model, target_device, "restore_weights_before_loading")
++
++
++def postprocess_weight(model: nn.Module, target_device) -> None:
++    """Finalize quantized weights into kernel layout (Marlin repack, UE8M0 requant,
++    transpose, ...)."""
++    _apply_quant_method_hook(model, target_device, "process_weights_after_loading")
++
++
+ class BaseModelLoader(ABC):
+     """Base class for model loaders."""
+ 
+diff --git a/sglang/srt/speculative/dflash_worker.py b/sglang/srt/speculative/dflash_worker.py
+index f59f55b..d2bbcc2 100644
+--- a/sglang/srt/speculative/dflash_worker.py
++++ b/sglang/srt/speculative/dflash_worker.py
+@@ -352,6 +352,11 @@ class DFlashWorker:
+         # to flush here.
+         pass
+ 
++    def iter_runners(self) -> list[tuple[str, "ModelRunner"]]:
++        # Explicit so DFlash's __getattr__ doesn't delegate this to the target
++        # (whose model_runner is aliased here) and miss the real draft.
++        return [("draft", self.draft_model_runner)]
++
+     def _gather_req_to_token_masked(
+         self,
+         *,
+diff --git a/sglang/srt/speculative/eagle_worker_v2.py b/sglang/srt/speculative/eagle_worker_v2.py
+index 8822451..41c890c 100644
+--- a/sglang/srt/speculative/eagle_worker_v2.py
++++ b/sglang/srt/speculative/eagle_worker_v2.py
+@@ -1016,6 +1016,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
+         # allocator and kv cache pool are shared with target worker, which are cleared in scheduler
+         pass
+ 
++    def iter_runners(self) -> List[Tuple[str, "ModelRunner"]]:
++        return [("draft", self.draft_worker.draft_runner)]
++
+     def forward_batch_generation(self, batch: ScheduleBatch, on_publish=None):
+         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+             # Target prefill
+diff --git a/sglang/srt/speculative/frozen_kv_mtp_worker.py b/sglang/srt/speculative/frozen_kv_mtp_worker.py
+index adb5564..44aabe0 100644
+--- a/sglang/srt/speculative/frozen_kv_mtp_worker.py
++++ b/sglang/srt/speculative/frozen_kv_mtp_worker.py
+@@ -200,6 +200,9 @@ class FrozenKVMTPWorker(TpModelWorker):
+     def clear_cache_pool(self):
+         pass
+ 
++    def iter_runners(self) -> List[Tuple[str, "ModelRunner"]]:
++        return [("draft", self.draft_model_runner)]
++
+     def _resolve_draft_backend_type(self) -> str:
+         return (
+             self.server_args.speculative_draft_attention_backend
+diff --git a/sglang/srt/speculative/multi_layer_eagle_worker_v2.py b/sglang/srt/speculative/multi_layer_eagle_worker_v2.py
+index c64c2d1..a1d97f2 100644
+--- a/sglang/srt/speculative/multi_layer_eagle_worker_v2.py
++++ b/sglang/srt/speculative/multi_layer_eagle_worker_v2.py
+@@ -788,6 +788,9 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
+         # allocator and kv cache pool are shared with target worker, which are cleared in scheduler
+         pass
+ 
++    def iter_runners(self) -> List[Tuple[str, "ModelRunner"]]:
++        return [(f"draft_step_{i}", r) for i, r in enumerate(self.draft_runner_list)]
++
+     def forward_batch_generation(self, batch: ScheduleBatch, on_publish=None):
+         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+             # Target prefill
+diff --git a/sglang/srt/speculative/ngram_worker.py b/sglang/srt/speculative/ngram_worker.py
+index d53522d..b75ed66 100644
+--- a/sglang/srt/speculative/ngram_worker.py
++++ b/sglang/srt/speculative/ngram_worker.py
+@@ -83,6 +83,11 @@ class NGRAMWorker:
+     def clear_cache_pool(self):
+         self.ngram_corpus.reset()
+ 
++    def iter_runners(self) -> list[tuple[str, "ModelRunner"]]:
++        # NGRAM shares the target's model_runner — no independent draft runner of its
++        # own (the target worker contributes its runner).
++        return []
++
+     def update_weights_from_tensor(self, recv_req):
+         # NGRAM has no draft weights of its own — the n-gram corpus is a CPU
+         # lookup structure built from request token streams — and its
+-- 
+2.43.0

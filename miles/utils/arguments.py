@@ -3298,17 +3298,20 @@ def miles_validate_args(args):
             args.offload_train = True
         if args.offload_rollout is None:
             args.offload_rollout = True
-        if args.sglang_cuda_graph_backend_prefill is None:
-            args.sglang_cuda_graph_backend_prefill = "disabled"
-            logger.info(
-                "Colocate mode: defaulting --sglang-cuda-graph-backend-prefill=disabled to avoid NVLS OOM. "
-                "Set --sglang-cuda-graph-backend-prefill explicitly to override."
-            )
-        elif args.sglang_cuda_graph_backend_prefill != "disabled":
-            logger.warning(
-                f"Warning: colocate mode with --sglang-cuda-graph-backend-prefill="
-                f"{args.sglang_cuda_graph_backend_prefill} may trigger NVLS OOM."
-            )
+        # Older sglang builds lack ServerArgs.cuda_graph_backend_prefill; _compute_server_args
+        # drops unknown sglang_* keys anyway, so only default/warn when the flag exists.
+        if hasattr(args, "sglang_cuda_graph_backend_prefill"):
+            if args.sglang_cuda_graph_backend_prefill is None:
+                args.sglang_cuda_graph_backend_prefill = "disabled"
+                logger.info(
+                    "Colocate mode: defaulting --sglang-cuda-graph-backend-prefill=disabled to avoid NVLS OOM. "
+                    "Set --sglang-cuda-graph-backend-prefill explicitly to override."
+                )
+            elif args.sglang_cuda_graph_backend_prefill != "disabled":
+                logger.warning(
+                    f"Warning: colocate mode with --sglang-cuda-graph-backend-prefill="
+                    f"{args.sglang_cuda_graph_backend_prefill} may trigger NVLS OOM."
+                )
         if args.rollout_num_gpus != args.actor_num_gpus_per_node * args.actor_num_nodes:
             logger.info(
                 f"rollout_num_gpus {args.rollout_num_gpus} != actor_num_gpus_per_node {args.actor_num_gpus_per_node} "

@@ -340,9 +340,12 @@ def start_mooncake_master(
 
     log_path = Path(log_path)
     quoted_log_path = shlex.quote(str(log_path))
+    # PPU mooncake (0.3.9) master defaults the KV object lease TTL to 5000ms,
+    # which would expire long-lived PPO rollout/weight-update bundles; relax to 1h.
     exec_command_cpu(
         "pkill -x mooncake_master >/dev/null 2>&1 || true; "
         f"(setsid mooncake_master --rpc_port {rpc_port} --metrics_port {metrics_port} "
+        f"--default_kv_lease_ttl=3600000 "
         f"> {quoted_log_path} 2>&1 &)"
     )
     try:

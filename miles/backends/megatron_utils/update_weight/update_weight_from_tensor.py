@@ -270,6 +270,7 @@ class UpdateWeightFromTensor:
                 results = ray.get(refs)
                 _check_weight_sync_results(results, is_lora=False)
                 del long_lived_tensors
+                dist.barrier(group=get_gloo_group())
 
             mm_tower_tensors = self._mm_tower_named_tensors()
             if mm_tower_tensors is not None:
@@ -280,6 +281,7 @@ class UpdateWeightFromTensor:
                 results = ray.get(refs)
                 _check_weight_sync_results(results, is_lora=False)
                 del long_lived_tensors, mm_tower_tensors
+                dist.barrier(group=get_gloo_group())
 
         if self.is_lora:
             # SGLang's load_lora_adapter_from_tensors expects the full adapter in
@@ -305,6 +307,7 @@ class UpdateWeightFromTensor:
             _check_weight_sync_results(results, is_lora=True)
             del long_lived_tensors
             del accumulated_named_tensors
+            dist.barrier(group=get_gloo_group())
             torch.cuda.ipc_collect()
             torch.cuda.empty_cache()
 
