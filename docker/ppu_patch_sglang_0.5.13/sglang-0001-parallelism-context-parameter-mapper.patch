@@ -1,3 +1,5 @@
+# Copyright © 2026 Zhejiang Runhe Cloud Intelligence Technology Co., Ltd
+
 parallel_state.py: add RankParallelismConfig and ParallelismContext, which
 allow creating a model shard with an explicit parallelism config outside a
 real distributed environment.

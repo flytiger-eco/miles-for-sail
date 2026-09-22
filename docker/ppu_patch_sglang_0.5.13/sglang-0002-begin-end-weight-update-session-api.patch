@@ -1,3 +1,5 @@
+# Copyright © 2026 Zhejiang Runhe Cloud Intelligence Technology Co., Ltd
+
 Adds a weight-update session API for quantized rollout engines.
 begin_weight_update restores in-place-packed weights (e.g. Marlin-repacked)
 to a loadable state before new weights arrive; end_weight_update optionally
