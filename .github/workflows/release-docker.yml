@@ -11,9 +11,9 @@ name: Release Docker Images
 # lockfile fingerprints are audit records, not restored build inputs.
 
 on:
-  push:
-    tags:
-      - "v[0-9]+.*"
+  # push:
+  #   tags:
+  #     - "v[0-9]+.*"
   workflow_dispatch:
     inputs:
       version:

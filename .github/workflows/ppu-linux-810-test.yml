@@ -4,7 +4,6 @@ on:
   workflow_dispatch:
   pull_request:
     branches:
-      - feature/ci-for-0.1.0
       - v*
     paths:
       - '.github/workflows/ppu-linux-810-test.yml'
@@ -13,7 +12,6 @@ on:
       - 'miles/**'
   push:
     branches:
-      - feature/ci-for-0.1.0
       - v*
     paths:
       - '.github/workflows/ppu-linux-810-test.yml'
