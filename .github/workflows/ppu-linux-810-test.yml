@@ -28,7 +28,6 @@ permissions:
   actions: read
 
 env:
-  # 预装了 miles 的 PPU 镜像，无需任何 build 步骤，直接在 pod 内跑 pytest。
   IMAGE: pkg.flytiger-eco.com/docker_release/llm:v2.1.1-miles0.1.0-pytorch2.11.0-ubuntu24.04-cuda13.0-sglang0.5.13-py312
   NAMESPACE: ppu-sched
   HOST_VOLUMES: "/nas_aisw:/nas_aisw,/wl_nas:/mnt/wl_nas"
