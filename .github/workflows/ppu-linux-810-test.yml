@@ -40,7 +40,7 @@ defaults:
 
 jobs:
   test:
-    name: ppu-test (810E 单卡)
+    name: ppu-test (810E 4卡)
     runs-on: k8s-runner-group-cpu-flytiger
     container:
       image: ghcr.io/actions/actions-runner:latest
@@ -68,7 +68,7 @@ jobs:
         uses: flytiger-eco/ppu-distributed-action@main
         with:
           nnodes: 0
-          nproc_per_node: 1
+          nproc_per_node: 4
           node_selector: ${{ env.NODE_SELECTOR }}
           host_volumes: ${{ env.HOST_VOLUMES }}
           image: ${{ env.IMAGE }}
