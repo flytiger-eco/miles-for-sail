@@ -1,0 +1,91 @@
+name: ppu-linux-810-test
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - v*
+    paths:
+      - '.github/workflows/ppu-linux-810-test.yml'
+      - '.github/scripts/ppu/**'
+      - 'tests/**'
+      - 'miles/**'
+  push:
+    branches:
+      - v*
+    paths:
+      - '.github/workflows/ppu-linux-810-test.yml'
+      - '.github/scripts/ppu/**'
+      - 'tests/**'
+      - 'miles/**'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  IMAGE: pkg.flytiger-eco.com/docker_release/llm:v2.1.1-miles0.1.0-pytorch2.11.0-ubuntu24.04-cuda13.0-sglang0.5.13-py312
+  NAMESPACE: ppu-sched
+  HOST_VOLUMES: "/nas_aisw:/nas_aisw,/wl_nas:/mnt/wl_nas"
+  SOURCE_DIR: /workspace/source
+  NODE_SELECTOR: "board-type=OAM-810E"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  test:
+    name: ppu-test (810E 4卡)
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout miles-for-sail
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 重试前等待 (checkout)
+        if: steps.checkout.outcome == 'failure'
+        run: sleep 15
+
+      - name: Checkout miles-for-sail (重试)
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: "810 run test cases"
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          nnodes: 0
+          nproc_per_node: 4
+          node_selector: ${{ env.NODE_SELECTOR }}
+          host_volumes: ${{ env.HOST_VOLUMES }}
+          image: ${{ env.IMAGE }}
+          namespace: ${{ env.NAMESPACE }}
+          source_dir: ${{ env.SOURCE_DIR }}
+          timeout_minutes: 120
+
+          command: |
+            bash <<'PPU_MILES_TEST'
+            set -uo pipefail
+            cd "${{ env.SOURCE_DIR }}"
+            echo "=== 环境自检 ==="
+            echo "hostname=$(hostname) node=${NODE_NAME:-unknown}"
+            python --version
+            (cd /tmp && python -c "import torch; print('torch', torch.__version__, torch.__file__); print('cuda_available', torch.cuda.is_available()); print('device_count', torch.cuda.device_count())") || true
+            ppu-smi || echo "[warn] ppu-smi 不可用，请确认 pod 已分配 PPU 设备"
+            echo "=== 执行 miles PPU 测试用例集合 ==="
+            bash .github/scripts/ppu/run_test_cases.sh
+            echo "[ppu-miles-test] 完成"
+            PPU_MILES_TEST
