@@ -1,7 +1,9 @@
 # Copyright © 2026 Zhejiang Runhe Cloud Intelligence Technology Co., Ltd
 
 # Miles-for-SAIL v0.1.0 PPU Docker Image
-# Build context = repo root (patches live in docker/ppu_patch_sglang_0.5.13/):
+# Build context = repo root; sglang patches live in docker/ppu_patch_sglang_0.5.13/,
+# and the miles-0001 patch must be supplied at
+# miles_0.1.0_sglang_0.5.13_patches/ in the build context:
 #   docker build -t miles-sail:v0.1.0 \
 #     -f docker/Dockerfile.ppu \
 #     --build-arg http_proxy=$http_proxy --build-arg https_proxy=$https_proxy .
@@ -113,7 +115,7 @@ RUN git clone --depth 1 --branch ${MILES_TAG} https://github.com/radixark/miles.
     test "$(git -C /root/miles rev-parse HEAD)" = 78527b9102b3a5f15891128cbec3ac6c2dc4089e
 
 # miles patches
-COPY docker/ppu_patch_sglang_0.5.13/miles-0001-sglang-0513-compat-and-gpu-id-sortkey.patch \
+COPY miles_0.1.0_sglang_0.5.13_patches/miles-0001-sglang-0513-compat-and-gpu-id-sortkey.patch \
      /tmp/miles-patches/
 
 RUN cd /root/miles && \
