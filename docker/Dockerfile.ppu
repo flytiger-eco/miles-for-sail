@@ -1,9 +1,7 @@
 # Copyright © 2026 Zhejiang Runhe Cloud Intelligence Technology Co., Ltd
 
 # Miles-for-SAIL v0.1.0 PPU Docker Image
-# Build context = repo root; sglang patches live in docker/ppu_patch_sglang_0.5.13/,
-# and the miles-0001 patch must be supplied at
-# miles_0.1.0_sglang_0.5.13_patches/ in the build context:
+# Build context = repo root (sglang patches live in docker/ppu_patch_sglang_0.5.13/):
 #   docker build -t miles-sail:v0.1.0 \
 #     -f docker/Dockerfile.ppu \
 #     --build-arg http_proxy=$http_proxy --build-arg https_proxy=$https_proxy .
@@ -15,7 +13,7 @@ ARG https_proxy
 ARG no_proxy
 
 ARG MEGATRON_COMMIT=37f91617b95c1ef4f01fc66210e502572ad97fda
-ARG MILES_TAG=v0.1.0
+ARG MILES_BRANCH=v0.1.0-SAIL
 
 WORKDIR /root/
 
@@ -108,19 +106,10 @@ RUN SP=/usr/local/lib/python3.12/site-packages && \
     fi
 
 # =====================================================================
-# Step 3: Install miles（radixark tag v0.1.0）
+# Step 3: Install miles（本仓库代码，PPU 适配 in-tree）
 # =====================================================================
 
-RUN git clone --depth 1 --branch ${MILES_TAG} https://github.com/radixark/miles.git /root/miles && \
-    test "$(git -C /root/miles rev-parse HEAD)" = 78527b9102b3a5f15891128cbec3ac6c2dc4089e
-
-# miles patches
-COPY miles_0.1.0_sglang_0.5.13_patches/miles-0001-sglang-0513-compat-and-gpu-id-sortkey.patch \
-     /tmp/miles-patches/
-
-RUN cd /root/miles && \
-    git apply /tmp/miles-patches/miles-0001-sglang-0513-compat-and-gpu-id-sortkey.patch && \
-    rm -rf /tmp/miles-patches
+COPY . /root/miles
 
 RUN grep -v ring_flash_attn /root/miles/requirements.txt > /tmp/requirements.txt && \
     pip install -r /tmp/requirements.txt \
@@ -254,7 +243,7 @@ RUN pip uninstall -y flash-attn-4 && \
 RUN printf '%s\n' \
     "image=miles-sail v0.1.0_sglang_0" \
     "megatron_commit=${MEGATRON_COMMIT} (radixark/Megatron-LM miles-main; removed base-image megatron-core 0.1.0/23.04)" \
-    "miles_tag=${MILES_TAG} commit=$(git -C /root/miles rev-parse HEAD) (patch 基线 78527b910) + miles-0001(compat+sortkey)" \
+    "miles_branch=${MILES_BRANCH} (基于 v0.1.0/78527b910，PPU 适配已合入分支)" \
     "sglang=0.5.13 in-place patched: 0001 + 0002(release+spec-worker-iter_runners)" \
     "apex=24.4.1+v0.1.0.ppu2.2.0 mbridge=git@89eb1088 flash-linear-attention=0.4.2 (standard; replaces PPU fla 1.0.0, no sail_fla) pla=1.0.0+v0.1.0.ppu2.2.0" \
     "torch_memory_saver=git@f05a8754 0.0.9.post1 (overrides PPU 0.0.9)" \
