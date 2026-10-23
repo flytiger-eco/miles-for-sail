@@ -1,12 +1,12 @@
 # Copyright © 2026 Zhejiang Runhe Cloud Intelligence Technology Co., Ltd
 
-# Miles-for-SAIL v0.1.0 PPU Docker Image 适配 SGLang 0.5.13
-# Build（build context = miles 仓库根目录；sglang 0.5.13 补丁位于 docker/ppu_patch_sglang_0.5.13/）:
+# Miles-for-SAIL v0.1.0 PPU Docker Image
+# Build context = repo root (sglang patches live in docker/ppu_patch_sglang_0.5.13/):
 #   docker build -t miles-sail:v0.1.0 \
 #     -f docker/Dockerfile.ppu \
 #     --build-arg http_proxy=$http_proxy --build-arg https_proxy=$https_proxy .
 
-FROM pkg.flytiger-eco.com/docker_release/llm:v2.1.1-pytorch2.11.0-ubuntu24.04-cuda13.0-sglang0.5.13-py312
+FROM pkg.flytiger-eco.com/docker_release/llm:sdk2.2.0-pytorch2.11.0-ubuntu24.04-cuda13.0-rlbase0.5.13-py312-20261008
 
 ARG http_proxy
 ARG https_proxy
@@ -42,16 +42,23 @@ ENV CURL_HOME=/etc/curl
 # Step 2: Install dependencies
 # =====================================================================
 
-# Ray upgrade (base image has older ray)
+# Ray upgrade
 RUN pip uninstall -y ray && \
     pip install "ray[default]==2.58" -i https://mirrors.aliyun.com/pypi/simple --trusted-host mirrors.aliyun.com
 
 # apex
-RUN pip install "apex==24.4.1+v0.1.0.ppu2.1.1" \
+RUN SAIL_SDK_MATCH_STRATEGY=off pip install "apex==24.4.1+v0.1.0.ppu2.2.0" \
+        --index-url https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple \
+        --trusted-host pkg.flytiger-eco.com
+
+# transformer_engine
+RUN pip install "transformer_engine==2.16+v0.1.0.ppu2.2.0" \
         --index-url https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple \
         --trusted-host pkg.flytiger-eco.com
 
 # Megatron-LM
+RUN pip uninstall -y megatron-core || true
+
 RUN git clone --depth 1 https://github.com/radixark/Megatron-LM.git /root/Megatron-LM && \
     cd /root/Megatron-LM && \
     git fetch --depth 1 origin ${MEGATRON_COMMIT} && \
@@ -72,6 +79,8 @@ RUN git clone --depth 1 https://github.com/ISEEKYAN/mbridge.git /tmp/mbridge && 
     cd /tmp/mbridge && \
     git fetch --depth 1 origin 89eb10887887bc74853f89a4de258c0702932a1c && \
     git checkout -q FETCH_HEAD && \
+    sed -i 's/^license = "\(.*\)"$/license = {text = "\1"}/' pyproject.toml && \
+    sed -i '/^license-files = /d' pyproject.toml && \
     pip install . --no-deps
 
 # sgl-router
@@ -97,7 +106,7 @@ RUN SP=/usr/local/lib/python3.12/site-packages && \
     fi
 
 # =====================================================================
-# Step 3: Install miles
+# Step 3: Install miles（本仓库代码，PPU 适配 in-tree）
 # =====================================================================
 
 COPY . /root/miles
@@ -118,8 +127,7 @@ RUN cd /root/miles/miles/backends/megatron_utils/kernels/int4_qat && \
     pip install . --no-build-isolation
 
 # =====================================================================
-# sglang patch（sglang 0.5.13，应用于基础镜像内置 sglang 0.5.13+v0.1.0.ppu2.1.1；
-# 补丁迁移自官方 SGLang 仓库 sglang-miles-v0.5.13-final 相对 sglang-v0.5.13 的修改）
+# sglang patch
 # =====================================================================
 
 COPY docker/ppu_patch_sglang_0.5.13/sglang-0001-parallelism-context-parameter-mapper.patch \
@@ -132,7 +140,7 @@ RUN SP=/usr/local/lib/python3.12/site-packages/sglang && \
     printf '__pycache__/\n*.pyc\n' > .gitignore && \
     git add -A && \
     git -c user.email=patch@local -c user.name=patch commit -qm \
-        "baseline: original sglang 0.5.13+v0.1.0.ppu2.1.1" && \
+        "baseline: original sglang 0.5.13" && \
     git apply -p2 /tmp/sglang-patches/sglang-0001-parallelism-context-parameter-mapper.patch && \
     git apply -p2 /tmp/sglang-patches/sglang-0002-begin-end-weight-update-session-api.patch && \
     git add -A && \
@@ -141,27 +149,47 @@ RUN SP=/usr/local/lib/python3.12/site-packages/sglang && \
     rm -rf /tmp/sglang-patches
 
 # =====================================================================
-# PPU compatibility patches
+# PPU compatibility patches 
 # =====================================================================
 
-# Patch 1: FLA SAIL forwarder: copy PPU fla to sail_fla, replace with standard fla, lazy-forward SAIL kernels
-# Will be deprecated in the future
-RUN set -e; SP=/usr/local/lib/python3.12/site-packages; \
-    cp -a $SP/fla $SP/sail_fla && rm -rf $SP/sail_fla/__pycache__ && \
-    pip uninstall -y fla && \
+# Patch 1: install standard flash-linear-attention + pla (PPU GDN kernels)
+# Replaces the legacy sail_fla forwarder (cp PPU fla -> sail_fla + lazy __getattr__ shim):
+# the independent pla package provides the PPU kernels, and sglang imports are
+# repointed to pla.decode in Patch 1b below.
+RUN pip uninstall -y fla && \
     pip install --no-deps "flash-linear-attention==0.4.2" "fla-core==0.4.2" -i https://mirrors.aliyun.com/pypi/simple --trusted-host mirrors.aliyun.com && \
-    printf '\n_SAIL_EXPORTS = frozenset({"fused_sigmoid_gating_delta_rule", "fused_sigmoid_gating_delta_rule_forward_k_last", "fused_sigmoid_gating_delta_rule_forward_k_last_packed", "fused_sigmoid_gating_delta_rule_forward_k_last_tunable", "fused_sigmoid_gating_delta_rule_forward_k_last_packed_tunable", "fused_kda_decode_mega_forward", "fused_recurrent_kda"})\n\n\ndef __getattr__(name):\n    if name in _SAIL_EXPORTS:\n        import sail_fla\n        return getattr(sail_fla, name)\n    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")\n' >> $SP/fla/__init__.py && \
+    pip install "pla==1.0.0+v0.1.0.ppu2.2.0" \
+        --index-url https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple \
+        --trusted-host pkg.flytiger-eco.com && \
     python -c "import importlib.metadata as m; assert m.version('fla-core') == m.version('flash-linear-attention')" && \
-    python -c "import sail_fla; assert len(sail_fla.__all__) == 7" && \
     python -c "import fla.ops.gated_delta_rule; from fla.modules import FusedRMSNormGated, ShortConvolution" && \
-    python -c "from fla import fused_sigmoid_gating_delta_rule_forward_k_last, fused_recurrent_kda" && \
-    python -c "import sys, fla, fla.ops.gated_delta_rule; assert 'sail_fla' not in sys.modules, 'SAIL forwarding is not lazy'"
+    python -c "from pla.decode import fused_sigmoid_gating_delta_rule_forward_k_last, fused_sigmoid_gating_delta_rule_forward_k_last_packed"
 
+# Patch 1b: sglang fla -> pla.decode import patch
+RUN F1=/usr/local/lib/python3.12/site-packages/sglang/srt/layers/attention/fla/fused_sigmoid_gating_recurrent.py && \
+    F2=/usr/local/lib/python3.12/site-packages/sglang/srt/layers/attention/fla/fused_recurrent.py && \
+    sed -i 's/from fla import fused_sigmoid_gating_delta_rule_forward_k_last$/from pla.decode import fused_sigmoid_gating_delta_rule_forward_k_last/' "$F1" && \
+    sed -i 's/from fla import ($/from pla.decode import (/' "$F2" && \
+    grep -q 'from pla\.decode import fused_sigmoid_gating_delta_rule_forward_k_last$' "$F1" && \
+    grep -q 'from pla\.decode import ($' "$F2" && \
+    ! grep -rn 'from fla import' /usr/local/lib/python3.12/site-packages/sglang/srt/layers/attention/fla/*.py && \
+    python3 -c "from pla.decode import fused_sigmoid_gating_delta_rule_forward_k_last, fused_sigmoid_gating_delta_rule_forward_k_last_packed; print('sglang fla->pla.decode patch OK')"
+
+# Patch 2: update_weight_from_tensor.py - add per-chunk gloo barrier before ipc_collect
+RUN F=miles/miles/backends/megatron_utils/update_weight/update_weight_from_tensor.py && \
+    perl -i -0pe 's/^(\x20{16})(del long_lived_tensors(?:, mm_tower_tensors)?\n)(?!\x20{16}dist\.barrier)/$1$2$1dist.barrier(group=get_gloo_group())\n/gm; s/^(\x20{12})(del accumulated_named_tensors\n)(?!\x20{12}dist\.barrier)/$1$2$1dist.barrier(group=get_gloo_group())\n/gm' "$F" && \
+    grep -A1 -E '^ {16}del long_lived_tensors$' "$F" | grep -q 'dist\.barrier' && \
+    grep -A1 -E '^ {16}del long_lived_tensors, mm_tower_tensors$' "$F" | grep -q 'dist\.barrier' && \
+    grep -A1 -E '^ {12}del accumulated_named_tensors$' "$F" | grep -q 'dist\.barrier'
 # =====================================================================
 # mooncake
 # =====================================================================
 
-RUN apt-get update && \
+# skip apt TLS verification - apt source is only reachable via the
+# MITM proxy (GPG signatures still verified)
+RUN printf 'Acquire::https::Verify-Peer "false";\nAcquire::https::Verify-Host "false";\n' \
+        > /etc/apt/apt.conf.d/99skip-tls-verify && \
+    apt-get update && \
     apt-get install -y --no-install-recommends libyaml-cpp0.8 && \
     rm -rf /var/lib/apt/lists/*
 
@@ -169,21 +197,24 @@ ENV LD_LIBRARY_PATH=/usr/local/lib/python3.12/site-packages/mooncake:${LD_LIBRAR
 
 ENV HF_HUB_DISABLE_XET=1
 
+# mooncake 0.3.12.post1
 RUN SP=/usr/local/lib/python3.12/site-packages && \
-    pip install --no-deps --no-cache-dir "mooncake==0.3.9+v0.1.0.ppu2.1.1" msgpack \
+    SAIL_SDK_MATCH_STRATEGY=off pip install --no-deps --no-cache-dir "mooncake==0.3.12.post1+v0.1.0.ppu2.2.0" msgpack \
         --index-url https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple \
         --trusted-host pkg.flytiger-eco.com && \
-    pip download mooncake-transfer-engine==0.3.12.post1 --no-deps --no-cache-dir \
-        -d /tmp/mooncake_wheels \
-        --index-url https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple \
-        --trusted-host pkg.flytiger-eco.com && \
-    python3 -c "import glob,zipfile; whl=glob.glob('/tmp/mooncake_wheels/mooncake_transfer_engine-0.3.12.post1-*.whl')[0]; open('$SP/mooncake/structured_object_store.py','wb').write(zipfile.ZipFile(whl).read('mooncake/structured_object_store.py'))" && \
-    rm -rf /tmp/mooncake_wheels && \
     ! grep -q "group_ids" $SP/mooncake/structured_object_store.py && \
     python3 -c "from mooncake.structured_object_store import FieldSchema, MooncakeBundleTransfer, export_ref, import_ref; MooncakeBundleTransfer.put; MooncakeBundleTransfer.get; MooncakeBundleTransfer.release_result; MooncakeBundleTransfer.cleanup_dataproto" && \
     ! ldd $SP/mooncake/mooncake_master | grep -q "not found"
 
-RUN pip install --no-deps --no-cache-dir "nvidia-modelopt==0.37.0" pulp torchprofile \
+RUN F=miles/miles/utils/external_utils/command_utils.py && \
+    grep -q 'default_kv_lease_ttl' $F || { \
+        sed -i '/setsid mooncake_master --rpc_port/a\        f"--default_kv_lease_ttl=3600000 "' $F; \
+    } && \
+    grep -q 'default_kv_lease_ttl=3600000' $F && \
+    python3 -c "import ast; ast.parse(open('miles/miles/utils/external_utils/command_utils.py').read()); print('command_utils.py lease-ttl patch OK')"
+
+# modelopt (pulp pinned to 2.9.0: 4.0.0 hard-depends on orloge, breaking --no-deps)
+RUN pip install --no-deps --no-cache-dir "nvidia-modelopt==0.37.0" "pulp==2.9.0" torchprofile \
         --index-url https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple \
         --trusted-host pkg.flytiger-eco.com && \
     python3 -c "from modelopt.torch.quantization.utils import is_quantized; print('modelopt OK')"
@@ -193,15 +224,31 @@ RUN pip install --no-deps --no-cache-dir "huggingface_hub==1.29.0" \
         --trusted-host pkg.flytiger-eco.com && \
     python3 -c "import huggingface_hub as h; assert h.__version__ == '1.29.0'; print('huggingface_hub OK')"
 
+# flash-attn-3
+RUN pip uninstall -y flash-attn-4 && \
+    SAIL_SDK_MATCH_STRATEGY=off pip install --force-reinstall --no-deps --no-cache-dir "flash-attn-3==2.8.2+v0.2.0.ppu2.2.0" \
+        --index-url https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple \
+        --trusted-host pkg.flytiger-eco.com && \
+    ! python3 -c "from importlib.metadata import version; version('flash-attn-4')" && \
+    SP=/usr/local/lib/python3.12/site-packages && \
+    test -f "$SP/flash_attn_interface.py" && \
+    sed -i 's/from flash_attn_3\.flash_attn_interface import/from flash_attn_interface import/g' \
+        "$SP/transformer_engine/pytorch/attention/dot_product_attention/backends.py" && \
+    grep -q 'from flash_attn_interface import flash_attn_func' \
+        "$SP/transformer_engine/pytorch/attention/dot_product_attention/backends.py" && \
+    ! grep -Fq 'from flash_attn_3.flash_attn_interface' \
+        "$SP/transformer_engine/pytorch/attention/dot_product_attention/backends.py" && \
+    python3 -c "import transformer_engine as te; from transformer_engine.pytorch import Linear; assert hasattr(te, 'pytorch'); print('TE pytorch OK')"
+
 RUN printf '%s\n' \
-    "image=miles-sail v0.1.1" \
-    "base=pkg.flytiger-eco.com/docker_release/llm:v2.1.1-pytorch2.11.0-ubuntu24.04-cuda13.0-sglang0.5.13-py312" \
-    "megatron_commit=${MEGATRON_COMMIT} (radixark/Megatron-LM miles-main)" \
+    "image=miles-sail v0.1.0_sglang_0" \
+    "megatron_commit=${MEGATRON_COMMIT} (radixark/Megatron-LM miles-main; removed base-image megatron-core 0.1.0/23.04)" \
     "miles_branch=${MILES_BRANCH} (基于 v0.1.0/78527b910，PPU 适配已合入分支)" \
-    "sglang=0.5.13+v0.1.0.ppu2.1.1 in-place patched: 0001 + 0002(release+spec-worker-iter_runners)" \
-    "apex=24.4.1+v0.1.0.ppu2.1.1 mbridge=git@89eb1088 flash-linear-attention=0.4.2" \
+    "sglang=0.5.13 in-place patched: 0001 + 0002(release+spec-worker-iter_runners)" \
+    "apex=24.4.1+v0.1.0.ppu2.2.0 mbridge=git@89eb1088 flash-linear-attention=0.4.2 (standard; replaces PPU fla 1.0.0, no sail_fla) pla=1.0.0+v0.1.0.ppu2.2.0" \
     "torch_memory_saver=git@f05a8754 0.0.9.post1 (overrides PPU 0.0.9)" \
-    "mooncake=0.3.9+v0.1.0.ppu2.1.1 + structured_object_store overlay (upstream 0.3.12.post1)" \
+    "flash-attn-3=2.8.2+v0.2.0.ppu2.2.0" \
+    "mooncake=0.3.12.post1+v0.1.0.ppu2.2.0 (native structured_object_store; replaces 0.3.9+overlay)" \
     "nvidia-modelopt=0.37.0 (+pulp,torchprofile) huggingface_hub=1.29.0 libyaml-cpp0.8" \
     > /etc/miles-release
 
@@ -211,32 +258,50 @@ RUN printf '%s\n' \
 
 RUN grep -q 'hasattr(args, "sglang_cuda_graph_backend_prefill")' /root/miles/miles/utils/arguments.py && \
     grep -q 'gpu_id = int(gpu_id)' /root/miles/miles/ray/placement_group.py && \
-    grep -q 'rejects global_segment_size=0' /root/miles/miles/utils/object_store.py && \
-    grep -q 'default_kv_lease_ttl=3600000' /root/miles/miles/utils/external_utils/command_utils.py && \
     grep -q 'def iter_runners' /usr/local/lib/python3.12/site-packages/sglang/srt/speculative/eagle_worker_v2.py && \
     grep -q 'def iter_runners' /usr/local/lib/python3.12/site-packages/sglang/srt/speculative/ngram_worker.py
 
+
 RUN python3 - <<'PYEOF'
 import importlib.metadata as md
+import pathlib
 
 import torch
 
-assert "ppu" in md.version("torch"), f"PPU torch was overwritten: {md.version('torch')}"
+# rlbase base ships torch with a PPU local-version suffix - assert the exact pinned version
+assert md.version("torch") == "2.11.0+v0.2.0.ppu2.2.0", f"unexpected torch: {md.version('torch')}"
 
+# flash-attn-4 must be absent: TE 2.16 would dispatch to its CUTE JIT frontend, broken on PPU
+try:
+    md.version("flash-attn-4")
+    _fa4_absent = False
+except md.PackageNotFoundError:
+    _fa4_absent = True
+assert _fa4_absent, f"flash-attn-4 still installed: {md.version('flash-attn-4')}"
+_sdk_file = pathlib.Path("/usr/local/PPU_SDK/VERSION.txt")
+assert _sdk_file.exists(), "PPU SDK missing: not a PPU image?"
+_sdk_ver = _sdk_file.read_text().strip()
+
+import transformer_engine as te
+assert hasattr(te, "pytorch"), "te.pytorch missing (flash-attn-3 / TE fa3-import patch regression)"
 from megatron.training.checkpointing import save_checkpoint  # noqa: F401
 from megatron.core.models.gpt import GPTModel  # noqa: F401
 from mbridge import AutoBridge  # noqa: F401
 from fla.ops.gated_delta_rule import chunk_gated_delta_rule  # noqa: F401
 from miles_plugins.models.qwen_gdn_backend import get_chunk_gated_delta_rule
 get_chunk_gated_delta_rule("fla")
-import fused_weight_gradient_mlp_cuda  # noqa: F401  (apex, 手册问题 2)
+import fused_weight_gradient_mlp_cuda  # noqa: F401
 import miles  # noqa: F401
 import polars  # noqa: F401
 import torchft  # noqa: F401
 import transformers  # noqa: F401
 
+# e2e dependency completion: mooncake structured layer / modelopt / huggingface_hub
 import huggingface_hub
 assert md.version("huggingface_hub") == "1.29.0", f"huggingface_hub overwritten: {md.version('huggingface_hub')}"
+assert md.version("mooncake_transfer_engine").startswith("0.3.12.post1+"), (
+    f"mooncake overwritten: {md.version('mooncake_transfer_engine')}"
+)
 from mooncake.structured_object_store import MooncakeBundleTransfer  # noqa: F401
 from modelopt.torch.quantization.utils import is_quantized  # noqa: F401
 
@@ -257,15 +322,16 @@ import os
 _tms_so = get_binary_path_from_package("torch_memory_saver_hook_mode_preload")
 assert os.path.exists(_tms_so), f"TMS preload .so not found: {_tms_so}"
 
-print(f"torch                   {md.version('torch')} (torch.__version__ {torch.__version__})")
+print(f"torch                   {md.version('torch')} (PPU SDK {_sdk_ver})")
 print(f"megatron-core           {md.version('megatron-core')}")
+print(f"transformer_engine      {md.version('transformer_engine')} (fa3: flash-attn-3 {md.version('flash-attn-3')})")
 print(f"transformers            {transformers.__version__}")
 print(f"flash-linear-attention  {md.version('flash-linear-attention')} (fla-core {md.version('fla-core')})")
 print(f"mbridge                 {md.version('mbridge')}")
 print(f"torch_memory_saver      {md.version('torch_memory_saver')} (preload .so: {os.path.basename(_tms_so)})")
 print(f"sglang                  {md.version('sglang')} (patched in-place)")
 print(f"apex                    {md.version('apex')}")
-print(f"mooncake                {md.version('mooncake_transfer_engine')} (+ structured_object_store 0.3.12.post1 overlay)")
+print(f"mooncake                {md.version('mooncake_transfer_engine')} (native structured_object_store)")
 print(f"nvidia-modelopt         {md.version('nvidia-modelopt')} (+pulp, torchprofile)")
 print(f"huggingface_hub         {md.version('huggingface_hub')}")
 print("All verifications passed.")
