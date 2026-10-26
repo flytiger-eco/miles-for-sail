@@ -1,3 +1,5 @@
+# Copyright © 2026 Zhejiang Runhe Cloud Intelligence Technology Co., Ltd
+
 import asyncio
 import logging
 import socket
@@ -69,6 +71,10 @@ def sort_key(x):
             # representation that allows for sorting.
             node_ip_parts = [ord(c) for c in node_identifier]
 
+    # ray.get_gpu_ids() returns numeric ids as strings ("8", "10") or GPU UUIDs;
+    # compare numeric ids as ints so that e.g. "10" does not sort before "8".
+    if isinstance(gpu_id, str) and gpu_id.isdigit():
+        gpu_id = int(gpu_id)
     return (node_ip_parts, gpu_id)
 
 

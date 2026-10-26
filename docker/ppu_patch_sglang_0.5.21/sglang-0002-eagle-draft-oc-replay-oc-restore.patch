@@ -1,0 +1,103 @@
+# Copyright © 2026 Zhejiang Runhe Cloud Intelligence Technology Co., Ltd
+
+diff --git a/python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py b/python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py
+index 543690c..357a215 100644
+--- a/python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py
++++ b/python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py
+@@ -527,6 +527,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
+     # -----------------------------------------------------------------
+     def execute(self, forward_batch: ForwardBatch):
+         assert forward_batch.out_cache_loc is not None
++        saved_oc = forward_batch.out_cache_loc
+         self.deepep_adapter.replay()
+         buffers = self.buffers
+ 
+@@ -612,6 +613,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
+         ):
+             copy_dsts.append(buffers.bootstrap_room_ids_int[:raw_bs])
+             copy_srcs.append(forward_batch.bootstrap_room_ids_int)
++        forward_batch.out_cache_loc = saved_oc
+         _grouped_foreach_copy_(copy_dsts, copy_srcs)
+ 
+         # hidden_states is large + contiguous: copy_() uses the cudaMemcpyAsync
+diff --git a/python/sglang/srt/managers/scheduler_components/weight_updater.py b/python/sglang/srt/managers/scheduler_components/weight_updater.py
+--- a/python/sglang/srt/managers/scheduler_components/weight_updater.py
++++ b/python/sglang/srt/managers/scheduler_components/weight_updater.py
+@@ -133,6 +133,9 @@
+     _session: Optional[_WeightUpdateSession] = None
+     _lora_stash: Dict[str, Dict[str, torch.Tensor]] = field(default_factory=dict)
+     _lora_applied_names: Dict[str, frozenset] = field(default_factory=dict)
++    # MILES_PATCH_RECAPTURE: weights were updated since the decode cuda graphs
++    # were last captured (drives recapture on CUDA_GRAPH resume, see below)
++    _weights_dirty: bool = False
+ 
+     @contextmanager
+     def _observe_weight_load(self, source: str) -> Iterator[None]:
+@@ -157,6 +160,9 @@
+             assert flush_cache_success, "Cache flush failed after updating weights"
+ 
+     def record_weight_version_after_update(self, weight_version: Optional[str]) -> None:
++        # MILES_PATCH_RECAPTURE: any successful weight update may invalidate
++        # decode cuda graphs captured before a TMS pause/resume cycle.
++        self._weights_dirty = True
+         if self._session is not None:
+             if weight_version is not None:
+                 self._session = msgspec.structs.replace(
+@@ -508,6 +514,9 @@
+         return True, "Success"
+ 
+     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
++        # MILES_PATCH_RECAPTURE: start of a new offload cycle; the graphs
++        # captured before this cycle are what matter once weights update.
++        self._weights_dirty = False
+         scheduler = self.scheduler
+         assert self.is_fully_idle(
+             ignore_waiting=scheduler is not None and scheduler._engine_paused
+@@ -564,6 +573,7 @@
+         if tags is None or len(tags) == 0:
+             tags = GPU_MEMORY_ALL_TYPES
+ 
++        graph_was_paused = GPU_MEMORY_TYPE_CUDA_GRAPH in self.offload_tags
+         for tag in tags:
+             self.offload_tags.remove(tag)
+ 
+@@ -597,6 +607,39 @@
+                     if queue is not None:
+                         queue.resume_memory_occupation()
+ 
++        # MILES_PATCH_RECAPTURE: after a colocate cycle (pause -> weight
++        # update -> resume), decode cuda graphs are stale and segfault on
++        # first replay; recapture them here, after all pools are resumed.
++        if (
++            GPU_MEMORY_TYPE_CUDA_GRAPH in tags
++            and graph_was_paused
++            and self._weights_dirty
++        ):
++            self._weights_dirty = False
++            # (a) target model graphs (decode + EAGLE target-verify): the
++            # from-disk path's recapture callable == init_decode_cuda_graph.
++            _ru = getattr(self.tp_worker.model_runner, "weight_updater", None)
++            if _ru is not None and callable(getattr(_ru, "recapture_cuda_graph", None)):
++                logger.info(
++                    "[MILES_PATCH_RECAPTURE] recapturing target decode/verify "
++                    "cuda graphs after weight update + memory resume"
++                )
++                _ru.recapture_cuda_graph()
++            # (b) EAGLE draft graphs (draft decode + draft extend): owned by
++            # the spec worker itself (self.draft_worker is the EagleWorker),
++            # NOT by the inner draft model_runner, so init_decode_cuda_graph
++            # on the draft runner does not cover them. r4 crashed exactly in
++            # eagle_draft_cuda_graph_runner._replay.
++            _dw = getattr(self.draft_worker, "_draft_worker", None)
++            if _dw is None:
++                _dw = self.draft_worker
++            if _dw is not None and callable(getattr(_dw, "_capture_cuda_graphs", None)):
++                logger.info(
++                    "[MILES_PATCH_RECAPTURE] recapturing EAGLE draft cuda "
++                    "graphs after weight update + memory resume"
++                )
++                _dw._capture_cuda_graphs()
++
+         return ResumeMemoryOccupationReqOutput()
+ 
+     def check_weights(self, recv_req: CheckWeightsReqInput):
