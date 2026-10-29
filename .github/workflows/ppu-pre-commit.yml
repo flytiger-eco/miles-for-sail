@@ -5,6 +5,12 @@ name: CI Pipeline
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
+  # Re-run the gates on review submissions and dismissals: the human gate
+  # times out after 6h and cannot turn green on a late approve unless a
+  # pull_request_review event restarts it (the reusable gate workflow is
+  # designed for exactly this; dismissed refreshes revoked approvals).
+  pull_request_review:
+    types: [submitted, dismissed]
 
 permissions:
   contents: read
