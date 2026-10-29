@@ -15,7 +15,7 @@ ARG no_proxy
 # miles: this repo's v0.1.2 branch (COPY'd below; adaptations in-tree)
 ARG MILES_BRANCH=v0.1.2
 ARG MEGATRON_COMMIT=fd15ee20a4f03b03680529baf4b8f7eeed64df1d
-# sglang: public github mirror (sglang-for-sail), v0.5.21 branch HEAD (unpinned)
+# sglang: public github mirror (sglang-for-sail), v0.5.21 branch pinned via SAIL_PIN
 ARG SGLANG_REPO=https://github.com/flytiger-eco/sglang-for-sail
 ARG SGLANG_BRANCH=v0.5.21
 
@@ -57,45 +57,74 @@ RUN printf '%s\n' \
 #         applied at build time + kernel ecosystem)
 # =====================================================================
 
-ENV RUSTUP_DIST_SERVER=https://mirrors.tuna.tsinghua.edu.cn/rustup \
-    RUSTUP_UPDATE_ROOT=https://mirrors.tuna.tsinghua.edu.cn/rustup/rustup \
-    PATH="/root/.cargo/bin:${PATH}"
+ENV RUSTUP_HOME=/opt/rust/rustup \
+    CARGO_HOME=/opt/rust/cargo \
+    RUSTUP_DIST_SERVER=https://rsproxy.cn \
+    RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup \
+    RUSTUP_USE_CURL=1 \
+    PATH="/opt/rust/cargo/bin:${PATH}"
 
 # Build tooling + apt deps (rust extension build requires libssl-dev + protoc)
+# NOTE: unset proxy build-args here -- pip/apt go straight to intranet sources
+#       (reachable without proxy in bridge net); BuildKit re-injects proxy ENV
+#       per RUN, so layers needing direct access must unset it themselves.
 RUN pip install --no-cache-dir \
         setuptools_rust "maturin[patchelf]" uv scikit-build-core \
         "cmake==3.31.2" wheel setuptools-scm build \
     && apt-get update \
-    && apt-get install -y --no-install-recommends libssl-dev protobuf-compiler \
+    && apt-get install -y --no-install-recommends libssl-dev protobuf-compiler openssl \
     && rm -rf /var/lib/apt/lists/*
 
-# Rust toolchain + cargo CN mirror (rsproxy sparse; crates.io index is slow in-network).
-# Proxy unset: rustup/cargo are the only cert-validating HTTP clients in the
-# image and reject a MITM proxy's private CA -- these layers go proxy-less.
-RUN unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY \
-    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-        | sh -s -- -y --profile minimal --default-toolchain stable \
-    && rustc --version && cargo --version && protoc --version \
-    && printf '%s\n' \
-        '[source.crates-io]' \
-        "replace-with = 'rsproxy-sparse'" \
-        '' \
-        '[source.rsproxy-sparse]' \
-        'registry = "sparse+https://rsproxy.cn/index/"' \
-        > /root/.cargo/config.toml
+# Rust toolchain via rustup (toolchains from the rsproxy CN mirror).
+# Cert capture is best-effort, never a gate -- on a clean network it is a
+# no-op; with a MITM proxy, rustup falls back to the proxy path on failure.
+# Crate downloads use crates.io upstream: rsproxy's crate CDN gets throttled
+# to 0B/s by the egress middlebox; [http] cainfo pins the captured bundle.
+RUN set -e; \
+    PROXY="${https_proxy:-${http_proxy:-}}"; \
+    unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY; \
+    mkdir -p /usr/local/share/ca-certificates; \
+    capcerts() { d="$1"; shift; timeout 25 openssl s_client -showcerts "$@" </dev/null 2>/dev/null \
+        | awk -v d="$d" '/BEGIN CERT/{i++} /BEGIN CERT/,/END CERT/{print > (d i ".crt")}'; }; \
+    capcerts /usr/local/share/ca-certificates/buildnet- \
+        -connect rsproxy.cn:443 || true; \
+    if [ ! -e /usr/local/share/ca-certificates/buildnet-1.crt ] && [ -n "$PROXY" ]; then \
+        ph="${PROXY#http://}"; ph="${ph#https://}"; ph="${ph%/}"; \
+        capcerts /usr/local/share/ca-certificates/buildnet- \
+            -proxy "$ph" -connect rsproxy.cn:443 || true; \
+    fi; \
+    echo "buildnet cert chain captured: $(ls /usr/local/share/ca-certificates/buildnet-*.crt 2>/dev/null | wc -l) cert(s)"; \
+    update-ca-certificates; \
+    export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt; \
+    curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs -o /tmp/rustup-init.sh \
+        || { [ -n "$PROXY" ] && export http_proxy="$PROXY" https_proxy="$PROXY" HTTP_PROXY="$PROXY" HTTPS_PROXY="$PROXY" \
+             && curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs -o /tmp/rustup-init.sh; }; \
+    sh /tmp/rustup-init.sh -y --no-modify-path --profile minimal --default-toolchain none; \
+    rm -f /tmp/rustup-init.sh; \
+    rustup toolchain install stable --profile minimal; \
+    rustc --version && cargo --version && protoc --version; \
+    printf '%s\n' \
+        '[http]' \
+        'cainfo = "/etc/ssl/certs/ca-certificates.crt"' \
+        'multiplexing = false' \
+        'timeout = 120' \
+        > "$CARGO_HOME/config.toml"
 
-# sglang-for-sail v0.5.21 branch HEAD (github retries once: transient
-# TLS transfer deaths); commit recorded for the release fingerprint
+# sglang-for-sail v0.5.21, PINNED to the verified sglang-for-sail baseline (SAIL_PIN):
+# patches below assert against this tree, so the branch must not float HEAD
+# (github retries once: transient TLS transfer deaths)
+ARG SAIL_PIN=de80b4a5ccd87c9b0d9985cb75d038c9232de6e9
 RUN mkdir -p /sgl-workspace \
-    && (git clone --branch ${SGLANG_BRANCH} --single-branch --depth 1 \
+    && (git clone --branch ${SGLANG_BRANCH} --single-branch --depth 250 \
         ${SGLANG_REPO} /sgl-workspace/sglang \
         || (rm -rf /sgl-workspace/sglang; sleep 15; \
-            git clone --branch ${SGLANG_BRANCH} --single-branch --depth 1 \
+            git clone --branch ${SGLANG_BRANCH} --single-branch --depth 250 \
             ${SGLANG_REPO} /sgl-workspace/sglang)) \
+    && git -C /sgl-workspace/sglang checkout --detach ${SAIL_PIN} \
     && git -C /sgl-workspace/sglang rev-parse HEAD | tee /tmp/sglang-commit.txt
 
 # v0.1.2 runtime-port merge patch: generated at build time from source commits
-# (base = sglang v0.5.21 tag, theirs = sglang-miles b84bec57, ours = s4s v0.5.21
+# (base = sglang v0.5.21 tag, theirs = sglang-miles b84bec57, ours = sglang-for-sail v0.5.21
 # branch HEAD; 13 conflict blocks auto-resolved, merge-tree/stat pinned inside
 # the script). Applied BEFORE the wheel build so the wheel ships it integrated.
 COPY docker/ppu_patch_sglang_0.5.21/scripts/gen_runtime_port_merge_v012.sh \
@@ -106,7 +135,7 @@ COPY docker/ppu_patch_sglang_0.5.21/scripts/gen_runtime_port_merge_v012.sh \
 # Generate the patch (merge-tree/stat asserted in-script), then apply it with a
 # decisive assertion chain
 RUN set -e && cd /sgl-workspace/sglang \
-    && GH_PROXY="$http_proxy" WORKDIR=/tmp/portmerge-gen OUT_DIR=/tmp/sglang-patches CLEANUP=1 \
+    && GH_PROXY="$http_proxy" SAIL_COMMIT=${SAIL_PIN} WORKDIR=/tmp/portmerge-gen OUT_DIR=/tmp/sglang-patches CLEANUP=1 \
        bash /tmp/sglang-patches/gen_runtime_port_merge_v012.sh \
     && git apply --check /tmp/sglang-patches/sglang-0001-miles-v0.1.2-runtime-port-ppu-merge.patch \
     && test "$(git apply --numstat /tmp/sglang-patches/sglang-0001-miles-v0.1.2-runtime-port-ppu-merge.patch | wc -l)" = "176" \
@@ -152,7 +181,8 @@ RUN cd /sgl-workspace/sglang \
 
 # Build the wheel (3 rust extensions; ~15 min). `uv build` hangs resolving
 # pyproject's pypi.org index in-network - use `python -m build`. Proxy unset:
-# cargo would fail the MITM CA check through a proxy.
+# cargo reaches rsproxy.cn directly; the buildnet MITM CA (if any) is handled
+# by the [http] cainfo in /opt/rust/cargo/config.toml above.
 RUN unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY \
     && cd /sgl-workspace/sglang/python \
     && rm -rf build dist *.egg-info sglang/_version.py \
@@ -692,7 +722,7 @@ print(f"causal-conv1d           {md.version('causal-conv1d')} (GDN short conv ->
 print("All verifications passed.")
 PYEOF
 
-RUN rm -rf /root/.cache/pip /root/.cargo/registry /root/.rustup \
+RUN rm -rf /root/.cache/pip /opt/rust/cargo/registry /opt/rust/rustup \
     /sgl-workspace/sglang/python/build /sgl-workspace/sglang/python/dist \
     /sgl-workspace/sglang/rust/target \
     /tmp/fla-src /tmp/sglang-patches /tmp/megatron-bridge /tmp/mbridge /tmp/miles_constraints.txt

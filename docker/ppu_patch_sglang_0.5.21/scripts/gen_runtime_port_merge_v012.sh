@@ -2,18 +2,18 @@
 # Copyright © 2026 Zhejiang Runhe Cloud Intelligence Technology Co., Ltd
 
 # =============================================================================
-# gen_runtime_port_merge_v012_s4s.sh
+# gen_runtime_port_merge_v012.sh
 # miles-sail v0.1.2 runtime-port patch 全自动再生成（自包含，任意有 git/python3
 # + 公网网络的环境可跑）。
 #
 # 功能链：
 #   Phase 1  从 git 源拉三个 ref（全公网 github）+ 拓扑断言
 #   Phase 2  raw patch 生成：git diff v0.5.21..sglang-miles(b84bec57) -- python/sglang/
-#   Phase 3  A' 三方 merge：worktree @ s4s v0.5.21 分支 HEAD + merge b84bec57
+#   Phase 3  A' 三方 merge：worktree @ sglang-for-sail v0.5.21 分支 HEAD + merge b84bec57
 #   Phase 4  13 块冲突自动解决（内嵌 resolve_conflicts，策略：保留两边修改）
 #   Phase 5  merge commit + merge tree hash 断言（MERGE_TREE_EXPECT，决定性）
-#   Phase 6  merge patch 导出：git diff <s4s HEAD>..HEAD -- python/sglang/
-#   Phase 7  干净 s4s 基线 apply-check（可用 APPLY_CHECK=0 跳过）
+#   Phase 6  merge patch 导出：git diff <sglang-for-sail HEAD>..HEAD -- python/sglang/
+#   Phase 7  干净 sglang-for-sail 基线 apply-check（可用 APPLY_CHECK=0 跳过）
 #
 # 输入：
 #   base   = sglang v0.5.21 tag        e00930c5489053f26d86b179cee0d087f846acbb
@@ -38,7 +38,7 @@
 #
 # 产出：
 #   $OUT_DIR/sglang-0001-miles-v0.1.2-runtime-port.patch         (raw, +8536/-1902)
-#   $OUT_DIR/sglang-0001-miles-v0.1.2-runtime-port-ppu-merge.patch (merge, 随 s4s
+#   $OUT_DIR/sglang-0001-miles-v0.1.2-runtime-port-ppu-merge.patch (merge, 随 sglang-for-sail
 #            基线前进而变，stat 由脚本打印并以 MERGE_STAT_EXPECT 断言)
 # =============================================================================
 set -euo pipefail
@@ -47,19 +47,19 @@ set -euo pipefail
 V521_COMMIT=e00930c5489053f26d86b179cee0d087f846acbb
 MILES_COMMIT=b84bec5761a6cdc8b1df86b9b89ead80a7a9bb02
 UPSTREAM_REPO=https://github.com/sgl-project/sglang.git
-S4S_REPO=https://github.com/flytiger-eco/sglang-for-sail.git
-S4S_BRANCH=v0.5.21
+SAIL_REPO=https://github.com/flytiger-eco/sglang-for-sail.git
+SAIL_BRANCH=v0.5.21
 MERGE_BRANCH=port/sglang-miles-v0.5.21-v0.1.2
-# merge tree 决定性断言（d457c50b 后继：s4s v0.5.21 @de80b4a5 基线实测值）。
-# s4s 分支前进后此值必变——fail loudly 提示重跑冲突审查并更新 pin。
+# merge tree 决定性断言（d457c50b 后继：sglang-for-sail v0.5.21 @de80b4a5 基线实测值）。
+# sglang-for-sail 分支前进后此值必变——fail loudly 提示重跑冲突审查并更新 pin。
 MERGE_TREE_EXPECT=${MERGE_TREE_EXPECT:-7953d49e8c4930335cb5b0c79649f9a0f865ac48}
 MERGE_STAT_EXPECT=${MERGE_STAT_EXPECT:-176 files changed, 8550 insertions(+), 1904 deletions(-)}
 MERGE_FILES_EXPECT=${MERGE_FILES_EXPECT:-176}
 
-# fetch 深度：s4s v0.5.21 相对 tag 前进 141+ 提交、miles 前进 37 提交；深度必须
+# fetch 深度：sglang-for-sail v0.5.21 相对 tag 前进 141+ 提交、miles 前进 37 提交；深度必须
 # 覆盖全部前进提交，否则浅克隆截断导致 merge-base 为空（OP-05 浅 fetch 伪影教训）。
 MILES_FETCH_DEPTH=60
-S4S_FETCH_DEPTH=250
+SAIL_FETCH_DEPTH=250
 
 RAW_NAME=sglang-0001-miles-v0.1.2-runtime-port.patch
 MERGE_NAME=sglang-0001-miles-v0.1.2-runtime-port-ppu-merge.patch
@@ -111,23 +111,32 @@ done
 [ "$CLONE_OK" = "1" ] || die "clone sglang-miles failed after 3 attempts"
 cd "$REPO"
 
-git remote add s4s "$S4S_REPO"
+git remote add sglang-for-sail "$SAIL_REPO"
 fetch_retry "fetch miles SHA (depth $MILES_FETCH_DEPTH)" \
     "${GIT_NET[@]}" fetch --depth "$MILES_FETCH_DEPTH" origin "$MILES_COMMIT"
 fetch_retry "fetch v0.5.21 tag" \
     "${GIT_NET[@]}" fetch --depth 1 origin tag v0.5.21
-fetch_retry "fetch s4s $S4S_BRANCH (depth $S4S_FETCH_DEPTH)" \
-    "${GIT_NET[@]}" fetch --depth "$S4S_FETCH_DEPTH" s4s "$S4S_BRANCH"
+fetch_retry "fetch sglang-for-sail $SAIL_BRANCH (depth $SAIL_FETCH_DEPTH)" \
+    "${GIT_NET[@]}" fetch --depth "$SAIL_FETCH_DEPTH" sglang-for-sail "$SAIL_BRANCH"
 
 V=$(git rev-parse "v0.5.21^{commit}")
 [ "$V" = "$V521_COMMIT" ] || die "v0.5.21 tag moved: $V != $V521_COMMIT"
 git cat-file -e "$MILES_COMMIT^{commit}" || die "miles commit $MILES_COMMIT not fetched"
-OURS_COMMIT=$(git rev-parse "s4s/$S4S_BRANCH")
-echo "   ours = s4s $S4S_BRANCH HEAD @ $OURS_COMMIT"
+# 可选 pin：设置 SAIL_COMMIT 后强制使用指定 sglang-for-sail 提交（复现已验证基线，分支 HEAD
+# 前进不再影响构建）；pin 不在 fetch 深度内时报错并提示加大 SAIL_FETCH_DEPTH。
+if [ -n "${SAIL_COMMIT:-}" ]; then
+    git cat-file -e "${SAIL_COMMIT}^{commit}" 2>/dev/null \
+        || die "sglang-for-sail pin commit $SAIL_COMMIT not in fetched history (raise SAIL_FETCH_DEPTH)"
+    OURS_COMMIT="$SAIL_COMMIT"
+    echo "   ours = sglang-for-sail PINNED @ $OURS_COMMIT (branch HEAD $(git rev-parse --short "sglang-for-sail/$SAIL_BRANCH") ignored)"
+else
+    OURS_COMMIT=$(git rev-parse "sglang-for-sail/$SAIL_BRANCH")
+    echo "   ours = sglang-for-sail $SAIL_BRANCH HEAD @ $OURS_COMMIT"
+fi
 
 MB=$(git merge-base "$OURS_COMMIT" "$MILES_COMMIT" || true)
-[ "$MB" = "$V521_COMMIT" ] || die "merge-base($OURS_COMMIT, $MILES_COMMIT)=$MB, expected $V521_COMMIT (shallow cut or s4s rebased? raise S4S_FETCH_DEPTH)"
-echo "   topology OK: base=$MB miles=+$(git rev-list --count $V521_COMMIT..$MILES_COMMIT) s4s=+$(git rev-list --count $V521_COMMIT..$OURS_COMMIT)"
+[ "$MB" = "$V521_COMMIT" ] || die "merge-base($OURS_COMMIT, $MILES_COMMIT)=$MB, expected $V521_COMMIT (shallow cut or sglang-for-sail rebased? raise SAIL_FETCH_DEPTH)"
+echo "   topology OK: base=$MB miles=+$(git rev-list --count $V521_COMMIT..$MILES_COMMIT) sglang-for-sail=+$(git rev-list --count $V521_COMMIT..$OURS_COMMIT)"
 
 # ============================================================================
 # Phase 2: raw patch 生成（git diff v0.5.21..b84bec57 -- python/sglang/）
@@ -148,7 +157,7 @@ if [ -n "$REF_DIR" ] && [ -f "$REF_DIR/$RAW_NAME" ]; then
 fi
 
 # ============================================================================
-# Phase 3: A' 三方 merge（worktree @ s4s v0.5.21 基线 + merge miles）
+# Phase 3: A' 三方 merge（worktree @ sglang-for-sail v0.5.21 基线 + merge miles）
 # ============================================================================
 WT=$WORKDIR/portmerge-wt
 git worktree prune 2>/dev/null || true
@@ -197,11 +206,11 @@ cat > "$WORKDIR/resolve_conflicts_v012.py" <<'PYEOF'
 #!/usr/bin/env python3
 """v0.1.2 A' 三方 merge 冲突解决（13 块，策略：保留两边修改）。
 
-ours  = s4s (flytiger-eco/sglang-for-sail) v0.5.21 分支 HEAD（动态）
+ours  = sglang-for-sail (flytiger-eco/sglang-for-sail) v0.5.21 分支 HEAD（动态）
 theirs= sglang-miles b84bec57 (v0.5.21 + 37 commits)
 
 融合原则：
-- s4s 特性全保留：NaN-GUARD、NVTX profiling、CP prefill、
+- sglang-for-sail 特性全保留：NaN-GUARD、NVTX profiling、CP prefill、
   PR#19148 set_index_k_scale_buffer、deepgemm mxfp4 scale、
   kimi dtype 守卫、packed_modules_mapping、dsv4 bf16 topk 路由、
   deepseek_nextn DSA CP prefill 初始化
@@ -571,7 +580,7 @@ K3_B2 = """
         return name
 """
 
-# ============ deepseek_nextn.py（1 块，v2 新增：s4s DSA CP vs miles loader） ============
+# ============ deepseek_nextn.py（1 块，v2 新增：sglang-for-sail DSA CP vs miles loader） ============
 
 DSNEXTN_B1 = """
         self.use_dsa = is_deepseek_dsa(config)
@@ -605,7 +614,7 @@ PYEOF
 PORTMERGE_ROOT=$WT/python/sglang python3 "$WORKDIR/resolve_conflicts_v012.py"
 
 # 8 文件语法校验（与 OP-06 流程一致的 ast.parse 全绿要求）
-S4S_BRANCH_REF="s4s/$S4S_BRANCH" python3 - <<'PYAST'
+SAIL_BRANCH_REF="sglang-for-sail/$SAIL_BRANCH" python3 - <<'PYAST'
 import ast, os, subprocess
 base = "python/sglang/"
 files = [
@@ -618,7 +627,7 @@ files = [
     "srt/layers/quantization/mxfp4.py",
     "srt/models/kimi_k3.py",
 ]
-ref = os.environ["S4S_BRANCH_REF"]
+ref = os.environ["SAIL_BRANCH_REF"]
 ok, skip = 0, 0
 for f in files:
     try:
@@ -646,7 +655,7 @@ PYAST
 # ============================================================================
 # （committer 身份已在 Phase 3 merge 前配置）
 git add -A
-git commit -q -m "Merge sglang-miles b84bec57 (v0.1.2 runtime-port) into s4s v0.5.21"
+git commit -q -m "Merge sglang-miles b84bec57 (v0.1.2 runtime-port) into sglang-for-sail v0.5.21"
 
 TREE=$(git rev-parse "HEAD^{tree}")
 if [ -n "$MERGE_TREE_EXPECT" ]; then
@@ -690,8 +699,8 @@ if [ "$APPLY_CHECK" = "1" ]; then
     git worktree prune
     git worktree add --detach "$WT_CHECK" "$OURS_COMMIT" >/dev/null
     git -C "$WT_CHECK" apply --check "$MERGE_OUT" \
-        && echo "   apply-check: PASS (clean apply to s4s $S4S_BRANCH @ $OURS_COMMIT)" \
-        || die "apply-check FAILED on clean s4s baseline"
+        && echo "   apply-check: PASS (clean apply to sglang-for-sail $SAIL_BRANCH @ $OURS_COMMIT)" \
+        || die "apply-check FAILED on clean sglang-for-sail baseline"
     git worktree remove --force "$WT_CHECK"
     git worktree prune
 fi
