@@ -3,61 +3,62 @@
 
 # =============================================================================
 # gen_runtime_port_merge_v012.sh
-# miles-sail v0.1.2 runtime-port patch 全自动再生成（自包含，任意有 git/python3
-# + 公网网络的环境可跑）。
+# miles-sail v0.1.2 runtime-port patch regeneration (fully automated and
+# self-contained; runs anywhere with git/python3 + public network access).
 #
-# 功能链：
-#   Phase 1  从 git 源拉三个 ref（全公网 github）+ 拓扑断言
-#   Phase 2  raw patch 生成：git diff v0.5.21..sglang-miles(b84bec57) -- python/sglang/
-#   Phase 3  A' 三方 merge：worktree @ sglang-for-sail v0.5.21 分支 HEAD + merge b84bec57
-#   Phase 4  13 块冲突自动解决（内嵌 resolve_conflicts，策略：保留两边修改）
-#   Phase 5  merge commit + merge tree hash 断言（MERGE_TREE_EXPECT，决定性）
-#   Phase 6  merge patch 导出：git diff <sglang-for-sail HEAD>..HEAD -- python/sglang/
-#   Phase 7  干净 sglang-for-sail 基线 apply-check（可用 APPLY_CHECK=0 跳过）
+# Pipeline:
+#   Phase 1  fetch three refs from public github + topology assertion
+#   Phase 2  raw patch generation: git diff v0.5.21..sglang-miles(b84bec57) -- python/sglang/
+#   Phase 3  A' three-way merge: worktree @ sglang-for-sail v0.5.21 branch HEAD + merge b84bec57
+#   Phase 4  auto-resolve 13 conflict blocks (embedded resolve_conflicts, strategy: keep both sides)
+#   Phase 5  merge commit + merge tree hash assertion (MERGE_TREE_EXPECT, decisive)
+#   Phase 6  merge patch export: git diff <sglang-for-sail HEAD>..HEAD -- python/sglang/
+#   Phase 7  apply-check on a clean sglang-for-sail baseline (skip with APPLY_CHECK=0)
 #
-# 输入：
+# Inputs:
 #   base   = sglang v0.5.21 tag        e00930c5489053f26d86b179cee0d087f846acbb
-#   theirs = sglang-miles 分支          b84bec5761a6cdc8b1df86b9b89ead80a7a9bb02
-#   ours   = flytiger-eco/sglang-for-sail v0.5.21 分支 HEAD（动态取最新，不锁
-#            commit；merge-base 必须仍为 v0.5.21 tag，否则 fail loudly）
+#   theirs = sglang-miles branch        b84bec5761a6cdc8b1df86b9b89ead80a7a9bb02
+#   ours   = flytiger-eco/sglang-for-sail v0.5.21 branch HEAD (taken dynamically,
+#            not pinned to a commit; the merge-base must still be the v0.5.21 tag, else fail loudly)
 #
-# 前置条件：
-#   - github.com 可达（sgl-project/sglang 与 flytiger-eco/sglang-for-sail，
-#     https 无需凭据；MITM 代理环境设 GH_PROXY）
+# Prerequisites:
+#   - github.com reachable (sgl-project/sglang and flytiger-eco/sglang-for-sail,
+#     https needs no credentials; set GH_PROXY behind a MITM proxy)
 #   - git >= 2.30
 #
-# 环境变量（可选）：
-#   WORKDIR     工作目录（默认 /tmp/portmerge-v012-gen；内含克隆仓与 worktree）
-#   OUT_DIR     patch 输出目录（默认 <脚本所在目录>/../patches）
-#   REF_DIR     参考目录：若其中存在同名 patch 则逐字节 cmp 校验（默认空=跳过）
-#   GH_PROXY    http 代理 URL（如 http://host:port；默认空=直连）
-#   MERGE_TREE_EXPECT  期望 merge tree hash（空=探测模式，仅打印实际值）
-#   APPLY_CHECK 1=在干净基线做 git apply --check（默认 1）
-#   CLEANUP    1=结束时删除 WORKDIR（merge 克隆仓 + worktree，~1GB；Docker 构建
-#              层用，避免中间层残留大目录）
+# Environment variables (optional):
+#   WORKDIR     working directory (default /tmp/portmerge-v012-gen; holds the clone and the worktree)
+#   OUT_DIR     patch output directory (default <script dir>/../patches)
+#   REF_DIR     reference directory: byte-wise cmp against same-named patches when present (default empty = skip)
+#   GH_PROXY    http proxy URL (e.g. http://host:port; default empty = direct connection)
+#   MERGE_TREE_EXPECT  expected merge tree hash (empty = probe mode, only print the actual value)
+#   APPLY_CHECK 1 = run git apply --check on a clean baseline (default 1)
+#   CLEANUP    1 = delete WORKDIR at the end (merge clone + worktree, ~1GB; used by
+#              docker build layers to avoid bulky leftovers in intermediate layers)
 #
-# 产出：
+# Outputs:
 #   $OUT_DIR/sglang-0001-miles-v0.1.2-runtime-port.patch         (raw, +8536/-1902)
-#   $OUT_DIR/sglang-0001-miles-v0.1.2-runtime-port-ppu-merge.patch (merge, 随 sglang-for-sail
-#            基线前进而变，stat 由脚本打印并以 MERGE_STAT_EXPECT 断言)
+#   $OUT_DIR/sglang-0001-miles-v0.1.2-runtime-port-ppu-merge.patch (merge, changes as the sglang-for-sail
+#            baseline advances; stat printed by the script and asserted via MERGE_STAT_EXPECT)
 # =============================================================================
 set -euo pipefail
 
-# ---------- pinned refs（v0.1.2 专用，等价 release-lock + merge 树 d457c50b） ----------
+# ---------- pinned refs (v0.1.2 specific; equivalent release-lock + merge tree d457c50b) ----------
 V521_COMMIT=e00930c5489053f26d86b179cee0d087f846acbb
 MILES_COMMIT=b84bec5761a6cdc8b1df86b9b89ead80a7a9bb02
 UPSTREAM_REPO=https://github.com/sgl-project/sglang.git
 SAIL_REPO=https://github.com/flytiger-eco/sglang-for-sail.git
 SAIL_BRANCH=v0.5.21
 MERGE_BRANCH=port/sglang-miles-v0.5.21-v0.1.2
-# merge tree 决定性断言（d457c50b 后继：sglang-for-sail v0.5.21 @de80b4a5 基线实测值）。
-# sglang-for-sail 分支前进后此值必变——fail loudly 提示重跑冲突审查并更新 pin。
+# Decisive merge tree assertion (d457c50b successor: measured on the sglang-for-sail v0.5.21 @de80b4a5 baseline).
+# Once the sglang-for-sail branch advances this value must change -- fail loudly, re-run the conflict review and update the pin.
 MERGE_TREE_EXPECT=${MERGE_TREE_EXPECT:-7953d49e8c4930335cb5b0c79649f9a0f865ac48}
 MERGE_STAT_EXPECT=${MERGE_STAT_EXPECT:-176 files changed, 8550 insertions(+), 1904 deletions(-)}
 MERGE_FILES_EXPECT=${MERGE_FILES_EXPECT:-176}
 
-# fetch 深度：sglang-for-sail v0.5.21 相对 tag 前进 141+ 提交、miles 前进 37 提交；深度必须
-# 覆盖全部前进提交，否则浅克隆截断导致 merge-base 为空（OP-05 浅 fetch 伪影教训）。
+# Fetch depth: sglang-for-sail v0.5.21 is 141+ commits past the tag and miles is 37
+# commits past it; the depth must cover all of them, otherwise the shallow cut leaves an
+# empty merge-base (shallow-fetch artifact lesson).
 MILES_FETCH_DEPTH=60
 SAIL_FETCH_DEPTH=250
 
@@ -71,7 +72,7 @@ REF_DIR=${REF_DIR:-}
 APPLY_CHECK=${APPLY_CHECK:-1}
 CLEANUP=${CLEANUP:-0}
 
-# 公网 https：MITM 代理环境下经 GH_PROXY 注入（git fetch/clone 专用）
+# Public https: routed through GH_PROXY behind a MITM proxy (git fetch/clone only)
 if [ -n "${GH_PROXY:-}" ]; then
     GIT_NET=(git -c "http.proxy=$GH_PROXY" -c http.sslVerify=false)
 else
@@ -93,14 +94,15 @@ echo "== gen_runtime_port_merge_v012 =="
 echo "   WORKDIR=$WORKDIR  OUT_DIR=$OUT_DIR  REF_DIR=${REF_DIR:-<none>}"
 
 # ============================================================================
-# Phase 1: fresh clone + 三 ref fetch + 拓扑断言
+# Phase 1: fresh clone + fetch three refs + topology assertion
 # ============================================================================
 REPO=$WORKDIR/sglang.git
 rm -rf "$WORKDIR"
 mkdir -p "$WORKDIR"
 
-# clone 单独循环（不走 fetch_retry）：GnuTLS 瞬断可能残留半克隆目录，
-# 每次重试前先清掉，否则第二次 clone 因 "destination path already exists" 秒败
+# The clone gets its own retry loop (not fetch_retry): a GnuTLS hiccup can leave a
+# half-cloned directory behind; remove it before each retry, or the next clone dies
+# instantly with "destination path already exists"
 CLONE_OK=0
 for _i in 1 2 3; do
     rm -rf "$REPO"
@@ -122,8 +124,9 @@ fetch_retry "fetch sglang-for-sail $SAIL_BRANCH (depth $SAIL_FETCH_DEPTH)" \
 V=$(git rev-parse "v0.5.21^{commit}")
 [ "$V" = "$V521_COMMIT" ] || die "v0.5.21 tag moved: $V != $V521_COMMIT"
 git cat-file -e "$MILES_COMMIT^{commit}" || die "miles commit $MILES_COMMIT not fetched"
-# 可选 pin：设置 SAIL_COMMIT 后强制使用指定 sglang-for-sail 提交（复现已验证基线，分支 HEAD
-# 前进不再影响构建）；pin 不在 fetch 深度内时报错并提示加大 SAIL_FETCH_DEPTH。
+# Optional pin: when SAIL_COMMIT is set, force the specified sglang-for-sail commit
+# (reproduce the verified baseline; a branch HEAD advance no longer affects the
+# build); if the pin is outside the fetched depth, fail and suggest raising SAIL_FETCH_DEPTH.
 if [ -n "${SAIL_COMMIT:-}" ]; then
     git cat-file -e "${SAIL_COMMIT}^{commit}" 2>/dev/null \
         || die "sglang-for-sail pin commit $SAIL_COMMIT not in fetched history (raise SAIL_FETCH_DEPTH)"
@@ -139,7 +142,7 @@ MB=$(git merge-base "$OURS_COMMIT" "$MILES_COMMIT" || true)
 echo "   topology OK: base=$MB miles=+$(git rev-list --count $V521_COMMIT..$MILES_COMMIT) sglang-for-sail=+$(git rev-list --count $V521_COMMIT..$OURS_COMMIT)"
 
 # ============================================================================
-# Phase 2: raw patch 生成（git diff v0.5.21..b84bec57 -- python/sglang/）
+# Phase 2: raw patch generation (git diff v0.5.21..b84bec57 -- python/sglang/)
 # ============================================================================
 RAW_OUT=$OUT_DIR/$RAW_NAME
 git diff "$V521_COMMIT" "$MILES_COMMIT" -- python/sglang/ > "$RAW_OUT"
@@ -157,23 +160,27 @@ if [ -n "$REF_DIR" ] && [ -f "$REF_DIR/$RAW_NAME" ]; then
 fi
 
 # ============================================================================
-# Phase 3: A' 三方 merge（worktree @ sglang-for-sail v0.5.21 基线 + merge miles）
+# Phase 3: A' three-way merge (worktree @ sglang-for-sail v0.5.21 baseline + merge miles)
 # ============================================================================
 WT=$WORKDIR/portmerge-wt
 git worktree prune 2>/dev/null || true
 git worktree add --detach "$WT" "$OURS_COMMIT" >/dev/null
 cd "$WT"
 
-# committer 身份必须在 MERGE 前配置（repo-local，worktree 共享主仓 config）：
-# git merge --no-commit 也要准备合并提交，无身份时直接 fatal exit 128
-# （r5 构建层实测：v012 容器因全局 git config 幸免，干净环境暴露）
+# The committer identity must be configured BEFORE the merge (repo-local; the
+# worktree shares the main repo config): git merge --no-commit still prepares
+# the merge commit and fatals with exit 128 without an identity (observed in
+# build-layer testing: the v012 container survived via its global git config;
+# a clean environment exposed it)
 git config user.name "miles-sail-build"
 git config user.email "miles-sail-build@users.noreply.github.com"
 
 git checkout -q -b "$MERGE_BRANCH"
 
-# merge 退出码分类：1=冲突（预期）；0/其他=意外（0 会被下方冲突集断言兕住，
-# 其他多为环境性 fatal——原版 `|| true` 会静默吞掉，改为显式报错）
+# Merge exit-code classification: 1 = conflict (expected); 0/anything else =
+# unexpected (0 is caught by the conflict-set assertion below; other codes are
+# usually environment fatals -- the original `|| true` silently swallowed them;
+# fail explicitly instead)
 set +e
 git merge --no-commit --no-ff "$MILES_COMMIT" >/dev/null 2>&1
 MERGE_RC=$?
@@ -200,29 +207,29 @@ fi
 echo "   merge conflicts: $CONFLICT_COUNT files / 13 blocks (as expected)"
 
 # ============================================================================
-# Phase 4: 12 块冲突解决（内嵌 resolver，逐文件按块序替换，保留两边修改）
+# Phase 4: auto-resolve 13 conflict blocks (embedded resolver; per file, in block order; keep both sides)
 # ============================================================================
 cat > "$WORKDIR/resolve_conflicts_v012.py" <<'PYEOF'
 #!/usr/bin/env python3
-"""v0.1.2 A' 三方 merge 冲突解决（13 块，策略：保留两边修改）。
+"""v0.1.2 A' three-way merge conflict resolution (13 blocks, strategy: keep both sides).
 
-ours  = sglang-for-sail (flytiger-eco/sglang-for-sail) v0.5.21 分支 HEAD（动态）
+ours  = sglang-for-sail (flytiger-eco/sglang-for-sail) v0.5.21 branch HEAD (dynamic)
 theirs= sglang-miles b84bec57 (v0.5.21 + 37 commits)
 
-融合原则：
-- sglang-for-sail 特性全保留：NaN-GUARD、NVTX profiling、CP prefill、
-  PR#19148 set_index_k_scale_buffer、deepgemm mxfp4 scale、
-  kimi dtype 守卫、packed_modules_mapping、dsv4 bf16 topk 路由、
-  deepseek_nextn DSA CP prefill 初始化
-- miles 特性全保留：capture/raw_result 双返回协议、tp_invariant row
-  linear、graph_num_tokens、mxfp4 in-place reload（reuse_parameter_storage
-  + runtime_specs 校验）、_bfa_w buffer 复用、get_lora_target_module_name、
+Fusion principles:
+- keep every sglang-for-sail feature: NaN-GUARD, NVTX profiling, CP prefill,
+  PR#19148 set_index_k_scale_buffer, deepgemm mxfp4 scale,
+  kimi dtype guard, packed_modules_mapping, dsv4 bf16 topk routing,
+  deepseek_nextn DSA CP prefill init
+- keep every miles feature: capture/raw_result dual-return protocol, tp_invariant row
+  linear, graph_num_tokens, mxfp4 in-place reload (reuse_parameter_storage
+  + runtime_specs validation), _bfa_w buffer reuse, get_lora_target_module_name,
   init_unified_loader_mappings
-- 协议适配点：CP 分支 return 改 _capture_and_return(topk, None)；dsv4
-  bf16 early-return 改 (result, raw_indices) 协议
+- protocol adaptation points: the CP-branch return becomes _capture_and_return(topk, None);
+  the dsv4 bf16 early-return switches to the (result, raw_indices) protocol
 
-（内嵌部署形态：ROOT 由环境变量 PORTMERGE_ROOT 注入，其余与
- scripts/resolve_conflicts.py 逐字节一致。）
+(Embedded deployment form: ROOT is injected from the PORTMERGE_ROOT env var;
+ everything else is byte-identical to scripts/resolve_conflicts.py.)
 """
 import os
 import sys
@@ -261,7 +268,7 @@ def resolve(path, solutions):
     print(f"OK {path}: {idx} blocks resolved")
 
 
-# ============ dsa_indexer.py（4 块） ============
+# ============ dsa_indexer.py (4 blocks) ============
 
 DSA_B1 = """
             # [NaN-GUARD] Gated by SGLANG_BF16_TOPK_DEBUG (default off).
@@ -411,7 +418,7 @@ DSA_B4 = """
                     )
 """
 
-# ============ dsa_topk_backend.py（1 块） ============
+# ============ dsa_topk_backend.py (1 block) ============
 
 TOPK_B1 = """
                 # Route PAGED path through dsv4's bf16 topk kernel when gate is on
@@ -432,13 +439,13 @@ TOPK_B1 = """
                 result = fast_topk_transform_fused(
 """
 
-# ============ glm4_moe_nextn.py（1 块） ============
+# ============ glm4_moe_nextn.py (1 block) ============
 
 GLM_B1 = """from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_exec, get_parallel, get_spec
 """
 
-# ============ model_runner.py（2 块） ============
+# ============ model_runner.py (2 blocks) ============
 
 MR_B1 = """
                 if SGLANG_PROFILE_NVTX:
@@ -462,7 +469,7 @@ MR_B2 = """
             )
 """
 
-# ============ linear.py（1 块） ============
+# ============ linear.py (1 block) ============
 
 LIN_B1 = """
             if SGLANG_PROFILE_NVTX:
@@ -493,7 +500,7 @@ LIN_B1 = """
             elif output_tensor is None:
 """
 
-# ============ mxfp4.py（1 块） ============
+# ============ mxfp4.py (1 block) ============
 
 MXFP4_B1 = """
                 deinterleave_moe_mxfp4_w13_for_marlin(
@@ -530,7 +537,7 @@ MXFP4_B1 = """
                 torch.cuda.empty_cache()
 """
 
-# ============ kimi_k3.py（2 块） ============
+# ============ kimi_k3.py (2 blocks) ============
 
 K3_B1 = """
             # Only plain bf16/fp16 dense weights are merged: quantized or
@@ -580,7 +587,7 @@ K3_B2 = """
         return name
 """
 
-# ============ deepseek_nextn.py（1 块，v2 新增：sglang-for-sail DSA CP vs miles loader） ============
+# ============ deepseek_nextn.py (1 block, v2 addition: sglang-for-sail DSA CP vs miles loader) ============
 
 DSNEXTN_B1 = """
         self.use_dsa = is_deepseek_dsa(config)
@@ -613,7 +620,7 @@ PYEOF
 
 PORTMERGE_ROOT=$WT/python/sglang python3 "$WORKDIR/resolve_conflicts_v012.py"
 
-# 8 文件语法校验（与 OP-06 流程一致的 ast.parse 全绿要求）
+# Syntax-check the 8 files (same ast.parse all-green requirement as the offline flow)
 SAIL_BRANCH_REF="sglang-for-sail/$SAIL_BRANCH" python3 - <<'PYAST'
 import ast, os, subprocess
 base = "python/sglang/"
@@ -634,9 +641,10 @@ for f in files:
         ast.parse(open(base + f).read())
         ok += 1
     except SyntaxError:
-        # 本机 python 可能老于源码语法（如 3.12 嵌套引号 f-string）：若 ours
-        # 原版同样 parse 失败属 pre-existing 环境限制（跳过）；原版可 parse
-        # 而合并后失败才是 merge 引入的语法断裂（die）。
+        # The local python may be older than the source syntax (e.g. 3.12
+        # nested-quote f-strings): if the ours original also fails to parse
+        # it is a pre-existing environment limitation (skip); a failure where
+        # the original parses fine is a merge-introduced syntax break (die).
         orig = subprocess.run(["git", "show", f"{ref}:{base}{f}"],
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                               universal_newlines=True)
@@ -651,9 +659,9 @@ print(f"AST-OK: {ok} files parsed, {skip} skipped (env limitation)")
 PYAST
 
 # ============================================================================
-# Phase 5: merge commit + tree hash 决定性断言
+# Phase 5: merge commit + decisive tree hash assertion
 # ============================================================================
-# （committer 身份已在 Phase 3 merge 前配置）
+# (committer identity was already configured before the merge in Phase 3)
 git add -A
 git commit -q -m "Merge sglang-miles b84bec57 (v0.1.2 runtime-port) into sglang-for-sail v0.5.21"
 
@@ -667,7 +675,7 @@ else
 fi
 
 # ============================================================================
-# Phase 6: merge patch 导出
+# Phase 6: merge patch export
 # ============================================================================
 MERGE_OUT=$OUT_DIR/$MERGE_NAME
 git diff "$OURS_COMMIT"..HEAD -- python/sglang/ > "$MERGE_OUT"
@@ -691,7 +699,7 @@ if [ -n "$REF_DIR" ] && [ -f "$REF_DIR/$MERGE_NAME" ]; then
 fi
 
 # ============================================================================
-# Phase 7: 干净基线 apply-check
+# Phase 7: apply-check on a clean baseline
 # ============================================================================
 if [ "$APPLY_CHECK" = "1" ]; then
     WT_CHECK=$WORKDIR/applycheck-wt
