@@ -1,0 +1,732 @@
+# Copyright © 2026 Zhejiang Runhe Cloud Intelligence Technology Co., Ltd
+
+# Miles-for-SAIL v0.1.2 Docker Image
+# Build context = repo root (sglang/fla patches live in docker/ppu_patch_sglang_0.5.21/):
+#   docker build -t miles-sail:v0.1.2 \
+#     -f docker/Dockerfile.ppu \
+#     --build-arg http_proxy=$http_proxy --build-arg https_proxy=$https_proxy .
+
+FROM pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001
+
+ARG http_proxy
+ARG https_proxy
+ARG no_proxy
+
+# miles: this repo's v0.1.2 branch (COPY'd below; adaptations in-tree)
+ARG MILES_BRANCH=v0.1.2
+ARG MEGATRON_COMMIT=fd15ee20a4f03b03680529baf4b8f7eeed64df1d
+# sglang: public github mirror (sglang-for-sail), v0.5.21 branch pinned via SAIL_PIN
+ARG SGLANG_REPO=https://github.com/flytiger-eco/sglang-for-sail
+ARG SGLANG_BRANCH=v0.5.21
+
+WORKDIR /root/
+
+# =====================================================================
+# Step 1: Environment configuration
+# =====================================================================
+
+# Proxy does SSL interception; skip verification globally
+RUN git config --global http.sslVerify false && \
+    git config --global http.postBuffer 524288000 && \
+    git config --global http.version HTTP/1.1 && \
+    pip config set global.trusted-host "pkg.flytiger-eco.com flytiger-pkg-global.flytiger-eco.com files.pythonhosted.org pypi.org"
+
+# wgetrc: skip SSL verification
+RUN echo 'check_certificate = off' > /etc/wgetrc && \
+    echo 'check_certificate = off' >> /root/.wgetrc
+
+# curl: skip SSL verification (BuildKit RUN leaves HOME unset, pin CURL_HOME)
+RUN mkdir -p /etc/curl && echo 'insecure' > /etc/curl/.curlrc && \
+    rm -f /etc/curlrc
+ENV CURL_HOME=/etc/curl
+
+# pip dependency constraints (pyarrow 25.0.1: numpy 1.26.4 compat line;
+# ray 2.58.0 satisfies the v0.1.2 requirements pin >=2.56.0,<2.59.0)
+RUN printf '%s\n' \
+    "numpy==1.26.4" \
+    "transformers==5.12.1" \
+    "torch==2.13.0" \
+    "safetensors==0.8.0" \
+    "zstandard==0.25.0" \
+    "ray==2.58.0" \
+    "pyarrow==25.0.1" \
+    > /tmp/miles_constraints.txt
+
+# =====================================================================
+# Step 2: SGLang 0.5.21 (source build + runtime-port merge patch
+#         applied at build time + kernel ecosystem)
+# =====================================================================
+
+ENV RUSTUP_HOME=/opt/rust/rustup \
+    CARGO_HOME=/opt/rust/cargo \
+    RUSTUP_DIST_SERVER=https://rsproxy.cn \
+    RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup \
+    RUSTUP_USE_CURL=1 \
+    PATH="/opt/rust/cargo/bin:${PATH}"
+
+# Build tooling + apt deps (rust extension build requires libssl-dev + protoc)
+# NOTE: unset proxy build-args here -- the base image already points at its
+#       package mirrors; BuildKit re-injects proxy ENV
+#       per RUN, so layers needing direct access must unset it themselves.
+RUN pip install --no-cache-dir \
+        setuptools_rust "maturin[patchelf]" uv scikit-build-core \
+        "cmake==3.31.2" wheel setuptools-scm build \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends libssl-dev protobuf-compiler openssl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Rust toolchain via rustup (toolchains from the rsproxy CN mirror).
+# Cert capture is best-effort, never a gate -- on a clean network it is a
+# no-op; with a MITM proxy, rustup falls back to the proxy path on failure.
+# Crate downloads use crates.io upstream (if a mirror CDN stalls, fall back
+# to crates.io); [http] cainfo pins the captured CA bundle.
+RUN set -e; \
+    PROXY="${https_proxy:-${http_proxy:-}}"; \
+    unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY; \
+    mkdir -p /usr/local/share/ca-certificates; \
+    capcerts() { d="$1"; shift; timeout 25 openssl s_client -showcerts "$@" </dev/null 2>/dev/null \
+        | awk -v d="$d" '/BEGIN CERT/{i++} /BEGIN CERT/,/END CERT/{print > (d i ".crt")}'; }; \
+    capcerts /usr/local/share/ca-certificates/proxy-ca- \
+        -connect rsproxy.cn:443 || true; \
+    if [ ! -e /usr/local/share/ca-certificates/proxy-ca-1.crt ] && [ -n "$PROXY" ]; then \
+        ph="${PROXY#http://}"; ph="${ph#https://}"; ph="${ph%/}"; \
+        capcerts /usr/local/share/ca-certificates/proxy-ca- \
+            -proxy "$ph" -connect rsproxy.cn:443 || true; \
+    fi; \
+    echo "proxy CA chain captured: $(ls /usr/local/share/ca-certificates/proxy-ca-*.crt 2>/dev/null | wc -l) cert(s)"; \
+    update-ca-certificates; \
+    export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt; \
+    curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs -o /tmp/rustup-init.sh \
+        || { [ -n "$PROXY" ] && export http_proxy="$PROXY" https_proxy="$PROXY" HTTP_PROXY="$PROXY" HTTPS_PROXY="$PROXY" \
+             && curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs -o /tmp/rustup-init.sh; }; \
+    sh /tmp/rustup-init.sh -y --no-modify-path --profile minimal --default-toolchain none; \
+    rm -f /tmp/rustup-init.sh; \
+    rustup toolchain install stable --profile minimal; \
+    rustc --version && cargo --version && protoc --version; \
+    printf '%s\n' \
+        '[http]' \
+        'cainfo = "/etc/ssl/certs/ca-certificates.crt"' \
+        'multiplexing = false' \
+        'timeout = 120' \
+        > "$CARGO_HOME/config.toml"
+
+# sglang-for-sail v0.5.21, PINNED to the verified sglang-for-sail baseline (SAIL_PIN):
+# patches below assert against this tree, so the branch must not float HEAD
+# (github retries once: transient TLS transfer deaths)
+ARG SAIL_PIN=de80b4a5ccd87c9b0d9985cb75d038c9232de6e9
+RUN mkdir -p /sgl-workspace \
+    && (git clone --branch ${SGLANG_BRANCH} --single-branch --depth 250 \
+        ${SGLANG_REPO} /sgl-workspace/sglang \
+        || (rm -rf /sgl-workspace/sglang; sleep 15; \
+            git clone --branch ${SGLANG_BRANCH} --single-branch --depth 250 \
+            ${SGLANG_REPO} /sgl-workspace/sglang)) \
+    && git -C /sgl-workspace/sglang checkout --detach ${SAIL_PIN} \
+    && git -C /sgl-workspace/sglang rev-parse HEAD | tee /tmp/sglang-commit.txt
+
+# v0.1.2 runtime-port merge patch: generated at build time from source commits
+# (base = sglang v0.5.21 tag, theirs = sglang-miles b84bec57, ours = sglang-for-sail v0.5.21
+# branch HEAD; 13 conflict blocks auto-resolved, merge-tree/stat pinned inside
+# the script). Applied BEFORE the wheel build so the wheel ships it integrated.
+COPY docker/ppu_patch_sglang_0.5.21/scripts/gen_runtime_port_merge_v0.1.2.sh \
+     docker/ppu_patch_sglang_0.5.21/pyproject_ppu.toml \
+     docker/ppu_patch_sglang_0.5.21/sglang-0002-eagle-draft-oc-replay-oc-restore.patch \
+     /tmp/sglang-patches/
+
+# Generate the patch (merge-tree/stat asserted in-script), then apply it with a
+# decisive assertion chain
+RUN set -e && cd /sgl-workspace/sglang \
+    && GH_PROXY="$http_proxy" SAIL_COMMIT=${SAIL_PIN} WORKDIR=/tmp/portmerge-gen OUT_DIR=/tmp/sglang-patches CLEANUP=1 \
+       bash /tmp/sglang-patches/gen_runtime_port_merge_v0.1.2.sh \
+    && git apply --check /tmp/sglang-patches/sglang-0001-miles-v0.1.2-runtime-port-ppu-merge.patch \
+    && test "$(git apply --numstat /tmp/sglang-patches/sglang-0001-miles-v0.1.2-runtime-port-ppu-merge.patch | wc -l)" = "176" \
+    && git apply /tmp/sglang-patches/sglang-0001-miles-v0.1.2-runtime-port-ppu-merge.patch \
+    && test "$(git status --porcelain -uall | wc -l)" = "176"
+# NOTE: the count assertion MUST use `git status --porcelain -uall` -- plain
+# --porcelain collapses untracked dirs into one `?? dir/` line.
+
+# sglang-0002: two fixes, static patch, applied after 0001 and BEFORE the wheel
+# build so the wheel ships it integrated:
+# (1) EAGLE draft graph replay overwrites out_cache_loc in-place: save/restore around replay.
+# (2) MILES_PATCH_RECAPTURE: after colocate weight updates, recapture target and draft decode graphs on CUDA_GRAPH resume.
+#     (The third earlier fix -- the duplicate pre-try eager draft block -- was
+#      fixed upstream in sglang-for-sail v0.5.21; guarded below by the
+#      draft_forward==1 assertion.)
+# md5 note: pinned against the repo copy, which carries the Runhe copyright
+# header.
+RUN set -e && cd /sgl-workspace/sglang \
+    && test "$(md5sum /tmp/sglang-patches/sglang-0002-eagle-draft-oc-replay-oc-restore.patch | cut -d' ' -f1)" = "10d7d463d94d32d2dbf9d25fd3af8454" \
+    && git apply --check /tmp/sglang-patches/sglang-0002-eagle-draft-oc-replay-oc-restore.patch \
+    && test "$(git apply --numstat /tmp/sglang-patches/sglang-0002-eagle-draft-oc-replay-oc-restore.patch | wc -l)" = "2" \
+    && git apply /tmp/sglang-patches/sglang-0002-eagle-draft-oc-replay-oc-restore.patch \
+    && grep -q 'saved_oc = forward_batch.out_cache_loc' \
+        python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py \
+    && test "$(grep -c 'self.draft_forward(forward_batch)' \
+        python/sglang/srt/speculative/eagle_worker_v2.py)" = "1" \
+    && test "$(grep -c '_weights_dirty' \
+        python/sglang/srt/managers/scheduler_components/weight_updater.py)" = "5" \
+    && grep -q '_dw._capture_cuda_graphs()' \
+        python/sglang/srt/managers/scheduler_components/weight_updater.py \
+    && python3 -m py_compile \
+        python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py \
+        python/sglang/srt/speculative/eagle_worker_v2.py \
+        python/sglang/srt/managers/scheduler_components/weight_updater.py
+
+# Activate the platform pyproject variant + local version tag for setuptools-scm
+RUN cd /sgl-workspace/sglang \
+    && cp python/pyproject.toml python/pyproject.toml.orig \
+    && cp /tmp/sglang-patches/pyproject_ppu.toml python/pyproject.toml \
+    && git tag v0.5.21 \
+    && git describe --tags
+
+# Build the wheel (3 rust extensions; ~15 min). `uv build` hangs resolving
+# pyproject's pypi.org index in-network - use `python -m build`. Proxy unset:
+# cargo reaches rsproxy.cn directly; the proxy CA (if any) is handled
+# by the [http] cainfo in /opt/rust/cargo/config.toml above.
+RUN unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY \
+    && cd /sgl-workspace/sglang/python \
+    && rm -rf build dist *.egg-info sglang/_version.py \
+    && python -m build --no-isolation --wheel --outdir dist . \
+    && ls -lh dist/
+
+RUN pip install --force-reinstall --no-deps /sgl-workspace/sglang/python/dist/sglang-0.5.21-*.whl && \
+    python3 -c "import importlib.metadata as im; assert im.version('sglang') == '0.5.21', im.version('sglang')"
+# NOTE: metadata-only assertion on purpose -- deep imports pull in regular deps
+# installed later; deep checks live in the post-deps check RUN below.
+
+# Strip the build-time proxy CA from the final image: it was only needed by
+# cargo during the wheel build above.
+RUN rm -f /usr/local/share/ca-certificates/proxy-ca-*.crt \
+    && update-ca-certificates --fresh
+
+# Kernel ecosystem (flytiger art source resolves platform-customized builds)
+RUN pip install "tilelang==0.1.8" "deep_gemm>=1.1.0" flash_mla "acext>=1.1.0" && \
+    pip install "flashinfer_python==0.6.17+v0.1.0.ppu2.2.0" --no-deps && \
+    pip install "apache-tvm-ffi==0.1.11"
+
+# fa3: explicit version pin + art pypi_index (bare-name install relied on the
+# base image's default index resolution; the exact local-version string keeps
+# a newly published higher build from silently winning the resolve).
+# sglang attention_backend='fa3' path (TE dual-package form; fa2 v2 is Step 7).
+RUN pip install "flash_attn_3==2.8.2+v0.2.0.ppu2.2.0" \
+        -i https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple && \
+    python3 -c "import importlib.metadata as im; assert im.version('flash-attn-3') == '2.8.2+v0.2.0.ppu2.2.0', im.version('flash-attn-3')"
+
+# pla: linear-attention kernels for the sglang FLA-family (KDA/GDN) rollout
+RUN pip install "pla==1.0.0+v0.1.0.ppu2.2.0" && \
+    python3 -c "from pla.decode import kda_mtp_sglang; from pla.prefill.flashkdapro import flashkda_fwd; from pla.decode.kda import fused_kda_decode_mega_forward" && \
+    python3 -c "import importlib.metadata as im; assert im.version('pla') == '1.0.0+v0.1.0.ppu2.2.0', im.version('pla')"
+
+# mooncake transfer engine: the art-source `mooncake` sdist is a
+# wheel-redirect shim -- the prebuilt wheel's INTERNAL dist name stays
+# mooncake-transfer-engine, so version assertions must query that name.
+RUN pip install "mooncake==0.3.12.post1+v0.1.0.ppu2.2.0" && \
+    python3 -c "import importlib.metadata as im; assert im.version('mooncake-transfer-engine') == '0.3.12.post1+v0.1.0.ppu2.2.0', im.version('mooncake-transfer-engine')" && \
+    python3 -c "import shutil; assert shutil.which('mooncake_master') is not None, 'mooncake_master console script missing'" && \
+    python3 -c "from mooncake.store import MooncakeDistributedStore; print('mooncake install check OK')"
+
+# tile_kernels: DeepSeek-V4 plugin dep; --no-deps (wheel declares
+# tilelang>=0.1.9, the platform build is 0.1.8)
+RUN pip install --no-deps "tile_kernels==1.0.0" && \
+    python3 -c "from tile_kernels.quant import per_token_cast_back" && \
+    python3 -c "import tilelang; assert tilelang.__version__ == '0.1.8+v0.2.0.ppu2.2.0', tilelang.__version__"
+
+# sglang-router + sgl-model-gateway: the OFFICIAL miles custom build
+# (radixark/sgl-router-for-miles @a0cf7da5; GenerateRequest has 51 fields incl.
+# return_routed_experts). Pure-CPU Rust abi3 wheel: runs unchanged.
+ARG MILES_WHEELS_URL=https://github.com/radixark/miles-wheels/releases/download/cu130-torch213-x86_64
+ARG SGL_ROUTER_WHL=sglang_router-0.3.2-cp38-abi3-manylinux_2_39_x86_64.whl
+ARG SGL_ROUTER_SHA256=28fede513319fcff4a38e5d859589498799c2e2861cc25d78ed371b3aaf3d192
+ARG SGL_GATEWAY_TGZ=sgl-model-gateway-linux-x86_64.tar.gz
+ARG SGL_GATEWAY_SHA256=69dde3b2084c55793718130b09781a819f95fde5f1ae341b847245bcb4aa0836
+# NOTE: --http1.1 + speed guards: in-network github CDN transfers die with
+# HTTP/2 PROTOCOL_ERROR (not covered by --retry) or stall with zero throughput
+# -- the guards turn both into a fast failure instead of a hang.
+RUN set -e && mkdir -p /tmp/wheels && cd /tmp/wheels && \
+    curl -fSL --http1.1 --retry 3 --speed-limit 4096 --speed-time 60 \
+        -o ${SGL_ROUTER_WHL} ${MILES_WHEELS_URL}/${SGL_ROUTER_WHL} && \
+    curl -fSL --http1.1 --retry 3 --speed-limit 4096 --speed-time 60 \
+        -o ${SGL_GATEWAY_TGZ} ${MILES_WHEELS_URL}/${SGL_GATEWAY_TGZ} && \
+    echo "${SGL_ROUTER_SHA256}  ${SGL_ROUTER_WHL}" | sha256sum -c - && \
+    echo "${SGL_GATEWAY_SHA256}  ${SGL_GATEWAY_TGZ}" | sha256sum -c - && \
+    pip install --force-reinstall --no-deps /tmp/wheels/${SGL_ROUTER_WHL} && \
+    tar xzf /tmp/wheels/${SGL_GATEWAY_TGZ} -C /usr/local/bin/ && \
+    chmod +x /usr/local/bin/sgl-model-gateway && \
+    python3 -c "import importlib.metadata as im; v = im.version('sglang-router'); assert v == '0.3.2', v" && \
+    python3 -c "import glob, os, sglang_router; so = glob.glob(os.path.dirname(sglang_router.__file__) + '/*.so'); b = open(so[0], 'rb').read(); assert b'return_routed_experts' in b and b'struct GenerateRequest with 51 elements' in b, 'router lacks return_routed_experts'; print('official sglang-router OK (51-field GenerateRequest)')" && \
+    sgl-model-gateway --version && \
+    rm -rf /tmp/wheels
+
+# torch_memory_saver: upstream source build @ b5588e83 (miles v0.1.2 official lock, aligns
+# miles docker/Dockerfile TMS install step).
+RUN (git clone https://github.com/fzyzcjy/torch_memory_saver.git /tmp/tms-src \
+        || (rm -rf /tmp/tms-src; sleep 15; \
+            git clone https://github.com/fzyzcjy/torch_memory_saver.git /tmp/tms-src)) \
+    && git -C /tmp/tms-src fetch --depth 1 origin b5588e83de86412a48689a6583a4b567e75f7acc \
+    && git -C /tmp/tms-src checkout -q FETCH_HEAD \
+    && test "$(git -C /tmp/tms-src rev-parse HEAD)" = "b5588e83de86412a48689a6583a4b567e75f7acc" \
+    && TMS_CUDA_MAJOR=13 pip install --no-cache-dir --force-reinstall --no-build-isolation /tmp/tms-src \
+    && python3 -c "import importlib.metadata as im; v = im.version('torch_memory_saver'); assert v == '0.0.9.post1', v" \
+    && python3 -c "import torch_memory_saver, glob, os, importlib.resources as ir; p = os.path.dirname(ir.files('torch_memory_saver')); assert glob.glob(p + '/torch_memory_saver_hook_mode_preload_cu13*.so'), 'preload cu13 .so missing'; from torch_memory_saver.utils import get_binary_path_from_package; assert os.path.exists(get_binary_path_from_package('torch_memory_saver_hook_mode_preload'))" \
+    && rm -rf /tmp/tms-src
+
+RUN pip config set global.trusted-host \
+    "pkg.flytiger-eco.com flytiger-pkg-global.flytiger-eco.com files.pythonhosted.org pypi.org"
+
+RUN pip install "https://pkg.flytiger-eco.com/artifactory/pypi_generic//deep_ep/2.2.0+v0.1.0.ppu2.2.0/deep_ep-2.2.0+cu130torch2.13.0ubuntu2404oe-cp312-cp312-linux_x86_64.whl" && \
+    python3 -c "import importlib.metadata as im; v = im.version('deep_ep'); assert v == '2.2.0+v0.1.0.ppu2.2.0', v" && \
+    python3 -c "from deep_ep import Buffer; print('deep_ep Buffer OK')"
+
+# Regular python deps of sglang (extracted from installed metadata; SKIP
+# covers platform-managed packages installed explicitly elsewhere).
+# NOTE: the extractor must be a printf pipe, not a heredoc -- BuildKit ends the
+# RUN instruction at the heredoc delimiter line.
+RUN set -e; deps=$(printf '%s\n' \
+    'import importlib.metadata as im' \
+    'from packaging.requirements import Requirement' \
+    'from packaging.markers import default_environment' \
+    'SKIP = {"torch", "torchvision", "torchaudio", "torch-memory-saver", "torch_memory_saver",' \
+    '        "flashinfer_python", "flashinfer-python", "tilelang", "deep_gemm", "deep-gemm",' \
+    '        "flash_attn_3", "flash-attn-3", "flash_mla", "flash-mla", "acext", "sglang",' \
+    '        "sglang-router", "sglang-kernel", "sgl-kernel", "cuda-python", "torchcodec",' \
+    '        "deep_ep", "deep-ep"}' \
+    'env = default_environment()' \
+    'for r in im.requires("sglang") or []:' \
+    '    req = Requirement(r)' \
+    '    if req.name.lower().replace("_", "-") in SKIP:' \
+    '        continue' \
+    '    if req.marker is not None:' \
+    '        m = str(req.marker)' \
+    '        if "extra" in m:' \
+    '            continue' \
+    '        if not req.marker.evaluate(env):' \
+    '            continue' \
+    '    print(str(req))' \
+    | python3 -); \
+    printf '%s\n' "$deps" | while IFS= read -r d; do \
+        [ -n "$d" ] || continue; \
+        pip install -c /tmp/miles_constraints.txt "$d" || echo "WARN: skip failed dep $d"; \
+    done
+
+RUN pip install --no-cache-dir tinker==0.26.2 typed-argument-parser && \
+    python3 -c "import tinker; import tap; print('tinker/tap install check OK')"
+
+# sglang build check (imports only; no GPU device assumption at build time)
+RUN python3 -c "import importlib; mods = [ \
+    'sglang', 'sglang.srt', 'sglang.srt.utils', 'sglang.lang', \
+    'sglang.srt.rust_extensions._grpc', 'sglang.srt.rust_extensions._multimodal', \
+    'sglang.srt.rust_extensions._server', \
+    'tilelang', 'deep_gemm', 'flash_attn_3', 'flash_mla', 'acext', \
+    'flashinfer', 'torch_memory_saver', 'deep_ep']; \
+    [importlib.import_module(m) for m in mods]; \
+    print('sglang install check OK')"
+
+# =====================================================================
+# Step 3: miles runtime-port patch landing assertions
+# =====================================================================
+
+RUN SP=/usr/local/lib/python3.12/site-packages/sglang && \
+    grep -q 'def begin_weight_update' $SP/srt/entrypoints/http_server.py && \
+    grep -q 'def end_weight_update' $SP/srt/entrypoints/http_server.py && \
+    grep -q 'async def pull_weights' $SP/srt/entrypoints/http_server.py && \
+    test -d $SP/srt/true_on_policy && \
+    python3 -m py_compile $SP/srt/entrypoints/http_server.py && \
+    python3 -c "from sglang.srt.distributed.parallel_state import ParallelismContext, RankParallelismConfig; from sglang.srt.true_on_policy import should_use_tp_invariant_row_linear; from sglang.srt.layers.linear import RowParallelLinear; print('sglang miles API check OK')"
+
+# =====================================================================
+# Step 4: Megatron-LM + bridge trio + modelopt
+# =====================================================================
+
+# Megatron-LM (radixark fork, miles-main; github retries once)
+RUN (git clone --depth 1 https://github.com/radixark/Megatron-LM.git /root/Megatron-LM \
+        || (rm -rf /root/Megatron-LM; sleep 15; \
+            git clone --depth 1 https://github.com/radixark/Megatron-LM.git /root/Megatron-LM)) && \
+    cd /root/Megatron-LM && \
+    (git fetch --depth 1 origin ${MEGATRON_COMMIT} \
+        || (sleep 10; git fetch --depth 1 origin ${MEGATRON_COMMIT})) && \
+    git checkout -q FETCH_HEAD && \
+    test "$(git rev-parse HEAD)" = ${MEGATRON_COMMIT} && \
+    if [ -f .gitmodules ]; then git submodule update --init --recursive; fi && \
+    pip install -e . --no-deps -c /tmp/miles_constraints.txt
+
+# Megatron-Bridge
+RUN (git clone --depth 1 https://github.com/radixark/Megatron-Bridge.git /tmp/megatron-bridge \
+        || (rm -rf /tmp/megatron-bridge; sleep 15; \
+            git clone --depth 1 https://github.com/radixark/Megatron-Bridge.git /tmp/megatron-bridge)) && \
+    cd /tmp/megatron-bridge && \
+    (git fetch --depth 1 origin 8cd3466d14d2337c8492827b3712482c2b3e4866 \
+        || (sleep 10; git fetch --depth 1 origin 8cd3466d14d2337c8492827b3712482c2b3e4866)) && \
+    git checkout -q FETCH_HEAD && \
+    pip install . --no-deps --no-build-isolation
+
+# mbridge
+RUN (git clone --depth 1 https://github.com/ISEEKYAN/mbridge.git /tmp/mbridge \
+        || (rm -rf /tmp/mbridge; sleep 15; \
+            git clone --depth 1 https://github.com/ISEEKYAN/mbridge.git /tmp/mbridge)) && \
+    cd /tmp/mbridge && \
+    (git fetch --depth 1 origin 89eb10887887bc74853f89a4de258c0702932a1c \
+        || (sleep 10; git fetch --depth 1 origin 89eb10887887bc74853f89a4de258c0702932a1c)) && \
+    git checkout -q FETCH_HEAD && \
+    sed -i 's/^license = "\(.*\)"$/license = {text = "\1"}/' pyproject.toml && \
+    sed -i '/^license-files = /d' pyproject.toml && \
+    pip install . --no-deps
+
+# Emerging-Optimizers + energon + multi-storage-client (git+ retries once)
+RUN (pip install "git+https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git@v0.3.0" \
+        || (sleep 15; pip install "git+https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git@v0.3.0")) && \
+    pip install megatron-energon --no-deps && \
+    pip install multi-storage-client --no-deps
+
+# nvidia-modelopt 0.47.0 (glm5 plugin import chain; v0.1.2 new)
+RUN pip install -c /tmp/miles_constraints.txt "nvidia-modelopt[torch]==0.47.0" --no-build-isolation && \
+    python3 -c "import modelopt; import importlib.metadata as im; assert im.version('nvidia-modelopt') == '0.47.0', im.version('nvidia-modelopt')"
+
+# torchtitan backend (official pin v0.3.0; --no-deps keeps its torch/datasets
+# pins away) + torchdata platform build (art-source prebuilt, --no-deps)
+RUN (git clone https://github.com/pytorch/torchtitan.git /root/torchtitan \
+        || (rm -rf /root/torchtitan; sleep 15; \
+            git clone https://github.com/pytorch/torchtitan.git /root/torchtitan)) && \
+    cd /root/torchtitan && git checkout -qf 086bf6c166ec85c1298eb5596fa9bf95f6a2d840 && \
+    pip install --no-deps --no-build-isolation -e . && \
+    pip install -c /tmp/miles_constraints.txt "spmd_types==0.2.3" "tyro>=1.0.5" && \
+    pip install --no-deps --no-build-isolation "torchdata==0.11.0+v0.1.0.ppu2.2.0" && \
+    cd / && python3 -c "import importlib.metadata as im; assert im.version('torchdata') == '0.11.0+v0.1.0.ppu2.2.0', im.version('torchdata'); assert im.version('spmd_types') == '0.2.3', im.version('spmd_types'); from torchtitan.distributed import ParallelDims; import tyro, torchdata; print('torchtitan backend deps OK')"
+
+# =====================================================================
+# Step 5: TransformerEngine + apex (same-generation platform builds)
+# =====================================================================
+
+RUN pip install -c /tmp/miles_constraints.txt "transformer-engine==2.16+v0.1.0.ppu2.2.0" && \
+    pip install -c /tmp/miles_constraints.txt einops onnx onnxscript pydantic nvdlfw-inspect && \
+    pip install -c /tmp/miles_constraints.txt "apex==24.4.1+v0.1.0.ppu2.2.0"
+
+# Official-image kernel set, platform builds (art-source prebuilt; --no-deps keeps
+# torch untouched). causal_conv1d has ONLY 1.7.0 (official 1.6.1; no 1.6.x
+# torch-2.13 platform build); with it importable, miles short_conv_backend()
+# auto-selects the fla "mix" backend for the GDN trainer conv.
+RUN pip install --no-deps --no-build-isolation \
+        "causal-conv1d==1.7.0+v0.1.0.ppu2.2.0" \
+        "mamba-ssm==2.3.1+v0.1.0.ppu2.2.0" \
+        "fast-hadamard-transform==1.1.0.post2+v0.1.0.ppu2.2.0" && \
+    cd / && python3 -c "import importlib.metadata as im; \
+assert im.version('causal-conv1d') == '1.7.0+v0.1.0.ppu2.2.0', im.version('causal-conv1d'); \
+assert im.version('mamba-ssm') == '2.3.1+v0.1.0.ppu2.2.0', im.version('mamba-ssm'); \
+assert im.version('fast-hadamard-transform') == '1.1.0.post2+v0.1.0.ppu2.2.0', im.version('fast-hadamard-transform'); \
+import torch, causal_conv1d_cuda, selective_scan_cuda, fast_hadamard_transform_cuda; \
+from causal_conv1d.cpp_functions import causal_conv1d_bwd_function; \
+import mamba_ssm, fast_hadamard_transform; print('causal_conv1d / mamba_ssm / fast_hadamard install check OK')"
+
+# =====================================================================
+# Step 6: Install miles (this repo's ${MILES_BRANCH} build context;
+#         adaptations in-tree, no patch step)
+# =====================================================================
+
+# In-tree adaptations carried by the branch (formerly the miles-0003 /
+# miles-0004 build-time patches):
+#   - colocate IPC gloo barrier after per-chunk IPC tensor cleanup
+#     (cuda_ipc.py, MILES_PATCH_IPC_BARRIER)
+#   - GPU id sortkey: compare numeric ids as ints (placement_group.py)
+COPY . /root/miles
+
+# In-tree adaptation assertions (the repo copy must carry the fixes)
+RUN grep -q 'MILES_PATCH_IPC_BARRIER' \
+        /root/miles/miles/backends/training_utils/weight_update/protocols/cuda_ipc.py && \
+    grep -q 'gpu_id = int(gpu_id)' /root/miles/miles/ray/placement_group.py && \
+    python3 -m py_compile \
+        /root/miles/miles/backends/training_utils/weight_update/protocols/cuda_ipc.py \
+        /root/miles/miles/ray/placement_group.py
+
+# ray first (fix to the validated 2.58.0; satisfies the <2.59.0 upper bound)
+RUN pip uninstall -y ray && \
+    pip install "ray[default]==2.58.0" -c /tmp/miles_constraints.txt
+
+# requirements (ring_flash_attn excluded: not compilable on this platform)
+RUN grep -v ring_flash_attn /root/miles/requirements.txt > /tmp/requirements.txt && \
+    pip install -r /tmp/requirements.txt -c /tmp/miles_constraints.txt && \
+    rm -f /tmp/requirements.txt
+
+RUN pip install -e /root/miles --no-deps -c /tmp/miles_constraints.txt
+
+# fake_int4_quant_cuda (int4 QAT export kernel): the official release wheel is
+# a CUDA build, so build the same source (miles int4_fake) with the platform SDK
+# nvcc (device-less build falls back to TORCH_CUDA_ARCH_LIST).
+RUN rm -rf /tmp/int4_fake && cp -r /root/miles/miles/kernels/quant/int4_fake /tmp/int4_fake && \
+    cd /tmp/int4_fake && MAX_JOBS=${MAX_JOBS:-16} pip wheel . --no-deps --no-build-isolation -w /tmp/int4_fake/dist && \
+    pip install --no-deps /tmp/int4_fake/dist/fake_int4_quant_cuda-*.whl && \
+    cd / && python3 -c "import torch, fake_int4_quant_cuda; assert hasattr(fake_int4_quant_cuda, 'fake_int4_quant_cuda'); print('fake_int4_quant_cuda (source build) OK')" && \
+    rm -rf /tmp/int4_fake
+
+ENV PYTHONPATH=/root/miles:/root/Megatron-LM
+
+# =====================================================================
+# Step 7: flash-attn v2 (TE fa path dual-package form)
+# =====================================================================
+# flash-attn v2: art-source direct URL (no wheel file ships with the build context)
+RUN pip install --force-reinstall --no-deps \
+        "https://pkg.flytiger-eco.com/artifactory/pypi_generic//flash_attn/2.8.2+v0.2.0.ppu2.2.0/flash_attn-2.8.2+cu130torch2.13.0ubuntu2404oe-cp312-cp312-linux_x86_64.whl" && \
+    python3 -c "import importlib.metadata as im; assert im.version('flash-attn') == '2.8.2+v0.2.0.ppu2.2.0', im.version('flash-attn')" && \
+    python3 -c "import transformer_engine as te; from transformer_engine.pytorch.attention.dot_product_attention import backends; assert backends.flash_attn_func is not None, 'TE fa2 path broken'; print('TE flash-attn dual package OK')"
+
+# =====================================================================
+# Step 8: FLA 0.5.2 original PyPI install + KDA hoist + sglang-kernel
+# =====================================================================
+
+# fla: original upstream 0.5.2 from PyPI. NOT --no-deps: the shell's real
+# payload is its dependency on fla-core==0.5.2 (carries the triton kernels)
+RUN set -e; SP=/usr/local/lib/python3.12/site-packages; \
+    pip uninstall -y flash-linear-attention fla-core 2>/dev/null || true; \
+    rm -rf $SP/fla /tmp/fla-src; \
+    pip install --no-cache-dir -c /tmp/miles_constraints.txt \
+        -i https://pypi.org/simple "flash-linear-attention==0.5.2" && \
+    python3 -c "import importlib.metadata as im; \
+assert im.version('flash-linear-attention') == '0.5.2', im.version('flash-linear-attention'); \
+assert im.version('fla-core') == '0.5.2', im.version('fla-core')" && \
+    python3 -c "import fla.ops.kda.chunk_intra_token_parallel; print('fla PyPI 0.5.2 (shell+core) OK')"
+
+# KDA hoist (upstream PR #1108): hoist the BK constexpr out of the @triton.jit
+# kernel body into the signature
+COPY docker/ppu_patch_sglang_0.5.21/fla-0001-kda-hoist-next-power-of-2.patch \
+     /tmp/fla_kda_hoist_next_power_of_2.patch
+
+RUN set -e; SP=/usr/local/lib/python3.12/site-packages; \
+    patch --fuzz=0 -p1 -d $SP/fla < /tmp/fla_kda_hoist_next_power_of_2.patch && \
+    grep -q 'BK=triton.next_power_of_2(K)' $SP/fla/ops/kda/chunk_intra_token_parallel.py && \
+    ! grep -q 'BK: tl.constexpr = triton.next_power_of_2' $SP/fla/ops/kda/chunk_intra_token_parallel.py && \
+    rm -f /tmp/fla_kda_hoist_next_power_of_2.patch
+
+# fla verification
+RUN cd / && \
+    python3 -c "import fla.ops.gated_delta_rule; from fla.modules import FusedRMSNormGated, ShortConvolution" && \
+    python3 -c "from fla.ops.kda import chunk_kda; from fla.ops.kda.gate import fused_kda_gate" && \
+    cd /root/miles && \
+    python3 -c "import importlib; mods = [ \
+    'miles_plugins.models.qwen3_next', \
+    'miles_plugins.models.kimi_k3.layers', \
+    'miles_plugins.models.glm5_next.kda']; \
+    [importlib.import_module(m) for m in mods]; \
+    print('miles_plugins fla consumers OK')"
+
+# sglang-kernel: triton_kernels provider required by the sglang import chain
+# but not in the wheel's requirements -- prebuilt wheel by direct URL
+RUN pip install "https://pkg.flytiger-eco.com/artifactory/pypi_generic//sglang_kernel/0.4.6.post1+v0.1.0.ppu2.2.0/sglang_kernel-0.4.6.post1+cu130torch2.13.0ubuntu2404oe-cp312-cp312-linux_x86_64.whl" && \
+    python3 -c "import importlib.metadata as im; v = im.version('sglang-kernel'); assert v == '0.4.6.post1+v0.1.0.ppu2.2.0', v" && \
+    python3 -c "from triton_kernels.numerics_details.mxfp import downcast_to_mxfp"
+
+# =====================================================================
+# Step 9: release fingerprint
+# =====================================================================
+
+# sglang 0.5.21 hard-asserts sglang-kernel >= 0.4.7 but no 0.4.7 platform build
+# exists -- bake the official escape hatch image-wide so every sglang
+# subprocess inherits it.
+ENV HF_HUB_DISABLE_XET=1 \
+    SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1
+
+RUN printf '%s\n' \
+    "image=miles-sail v0.1.2 (this repo build context; sglang-for-sail github + original fla 0.5.2 PyPI; zero wheel files in build context)" \
+    "base=pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001" \
+    "miles_branch=${MILES_BRANCH} (radixark/miles v0.1.2/a22fd824 + in-tree adaptations: colocate IPC barrier + GPU id sortkey)" \
+    "sglang=0.5.21 (sglang-for-sail v0.5.21 @$(cat /tmp/sglang-commit.txt)) + sglang-0001 runtime-port merge patch (176 files) + sglang-0002 EAGLE draft oc replay/restore + decode-graph recapture after colocate weight updates (2 files; both built into wheel)" \
+    "megatron=${MEGATRON_COMMIT} (radixark/Megatron-LM miles-main; editable; megatron-core 0.19.0)" \
+    "transformer_engine=2.16+v0.1.0.ppu2.2.0 apex=24.4.1+v0.1.0.ppu2.2.0 (int4_qat kernel bundled)" \
+    "flash-attn=2.8.2+v0.2.0.ppu2.2.0 + flash-attn-3 2.8.2+v0.2.0.ppu2.2.0 (TE dual-package form)" \
+    "flash-linear-attention=0.5.2 ORIGINAL PyPI (shell + fla-core split package) + KDA hoist patch" \
+    "pla=1.0.0+v0.1.0.ppu2.2.0 (linear-attn kernels; sglang FLA-family rollout path)" \
+    "mooncake=0.3.12.post1+v0.1.0.ppu2.2.0 (mooncake_transfer_engine; mooncake_master + MooncakeDistributedStore)" \
+    "tile_kernels=1.0.0 (DeepSeek-V4 plugin qat; target.patch NOT applied on tilelang 0.1.8)" \
+    "torch_memory_saver=0.0.9.post1 (upstream fzyzcjy source build @ b5588e83; miles v0.1.2 official lock; _cu13 suffix .so)" \
+    "sglang-kernel=0.4.6.post1+v0.1.0.ppu2.2.0 (triton_kernels provider; SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1 image-wide)" \
+    "deep_ep=2.2.0+v0.1.0.ppu2.2.0 (deepep.py top-level Buffer hard dep)" \
+    "nvidia-modelopt=0.47.0 (glm5 plugin import chain)" \
+    "pyarrow=25.0.1 (numpy 1.26.4 compat line)" \
+    "ray=2.58.0 torchft-nightly=2026.4.3 tilelang=0.1.8+v0.2.0.ppu2.2.0" \
+    "sglang-router=0.3.2 OFFICIAL (radixark/miles-wheels, 51-field GenerateRequest w/ return_routed_experts) + sgl-model-gateway 0.3.2 (/usr/local/bin); NOT the art-source build" \
+    "fake_int4_quant_cuda=0.0.0 (official source miles int4_fake v0.1.2/a22fd824, platform nvcc build)" \
+    "torchtitan=0.3.0 @086bf6c (editable --no-deps) spmd_types=0.2.3 tyro>=1.0.5 torchdata=0.11.0+v0.1.0.ppu2.2.0" \
+    "causal-conv1d=1.7.0+v0.1.0.ppu2.2.0 (only torch-2.13 build available; GDN short conv -> fla mix backend) mamba-ssm=2.3.1+v0.1.0.ppu2.2.0 fast-hadamard-transform=1.1.0.post2+v0.1.0.ppu2.2.0" \
+    > /etc/miles-release
+
+# =====================================================================
+# Final guard
+# =====================================================================
+
+RUN grep -q 'def begin_weight_update' /usr/local/lib/python3.12/site-packages/sglang/srt/entrypoints/http_server.py && \
+    grep -q 'def end_weight_update' /usr/local/lib/python3.12/site-packages/sglang/srt/entrypoints/http_server.py && \
+    grep -q 'saved_oc = forward_batch.out_cache_loc' /usr/local/lib/python3.12/site-packages/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py && \
+    grep -q 'MILES_PATCH_RECAPTURE' /usr/local/lib/python3.12/site-packages/sglang/srt/managers/scheduler_components/weight_updater.py && \
+    test -f /usr/local/lib/python3.12/site-packages/sglang/srt/true_on_policy/__init__.py
+
+# miles in-tree adaptations must survive into the installed tree
+RUN grep -q 'MILES_PATCH_IPC_BARRIER' /root/miles/miles/backends/training_utils/weight_update/protocols/cuda_ipc.py && \
+    grep -q 'gpu_id = int(gpu_id)' /root/miles/miles/ray/placement_group.py
+
+RUN cd /tmp && python3 - <<'PYEOF'
+import importlib.metadata as md
+import pathlib
+
+import torch
+
+# base image ships the platform torch; assert version + SDK presence
+assert md.version("torch") == "2.13.0+v0.1.0.ppu2.2.0", f"unexpected torch: {md.version('torch')}"
+_sdk_file = pathlib.Path("/usr/local/PPU_SDK/VERSION.txt")
+assert _sdk_file.exists(), "SDK VERSION.txt missing: unexpected base image?"
+_sdk_ver = _sdk_file.read_text().strip()
+
+import transformer_engine as te
+assert hasattr(te, "pytorch"), "te.pytorch missing"
+from transformer_engine.pytorch.attention.dot_product_attention import backends
+assert backends.flash_attn_func is not None, "TE fa2 path broken (flash-attn v2 missing)"
+from megatron.training.checkpointing import save_checkpoint  # noqa: F401
+from megatron.core.models.gpt import GPTModel  # noqa: F401
+from mbridge import AutoBridge  # noqa: F401
+import miles  # noqa: F401
+import polars  # noqa: F401
+import torchft  # noqa: F401
+import transformers  # noqa: F401
+assert md.version("transformers") == "5.12.1", f"transformers overwritten: {md.version('transformers')}"
+assert md.version("ray") == "2.58.0", f"ray unexpected: {md.version('ray')}"
+assert md.version("miles") == "0.1.2", f"miles unexpected: {md.version('miles')}"
+
+# e2e dependency: int4_qat kernel (bundled in the apex wheel)
+import fused_weight_gradient_mlp_cuda  # noqa: F401
+
+# e2e-proven pins: pyarrow (numpy 1.26.4 compat), deep_ep (hard dep),
+# nvidia-modelopt (glm5 plugin import chain)
+assert md.version("pyarrow") == "25.0.1", f"pyarrow drifted: {md.version('pyarrow')}"
+assert md.version("deep_ep") == "2.2.0+v0.1.0.ppu2.2.0", md.version("deep_ep")
+from deep_ep import Buffer  # noqa: F401
+assert md.version("nvidia-modelopt") == "0.47.0", md.version("nvidia-modelopt")
+import modelopt  # noqa: F401
+
+# sglang miles APIs (runtime-port merge patch built into the v0.5.21 wheel)
+from sglang.srt.distributed.parallel_state import (  # noqa: F401
+    ParallelismContext,
+    RankParallelismConfig,
+)
+from sglang.srt.true_on_policy import should_use_tp_invariant_row_linear  # noqa: F401
+from sglang.srt.layers.linear import RowParallelLinear  # noqa: F401
+from sglang.srt.entrypoints.http_server import app
+# _IncludedRouter objects aggregate sub-routers and carry no .path attribute
+paths = {r.path for r in app.routes if hasattr(r, "path")}
+assert "/begin_weight_update" in paths, "miles route /begin_weight_update missing"
+assert "/end_weight_update" in paths, "miles route /end_weight_update missing"
+
+# fla: assert via metadata (the split-package shell overwrites fla/__init__.py)
+import fla
+assert md.version("flash-linear-attention") == "0.5.2", md.version("flash-linear-attention")
+assert md.version("fla-core") == "0.5.2", md.version("fla-core")
+from fla.ops.kda import chunk_kda  # noqa: F401
+from fla.ops.kda.gate import fused_kda_gate  # noqa: F401
+from fla.modules import FusedRMSNormGated, ShortConvolution  # noqa: F401
+import miles_plugins.models.qwen3_next  # noqa: F401
+import miles_plugins.models.kimi_k3.layers  # noqa: F401
+import miles_plugins.models.glm5_next.kda  # noqa: F401
+
+# pla: linear-attn kernels for the sglang rollout path
+assert md.version("pla") == "1.0.0+v0.1.0.ppu2.2.0", md.version("pla")
+from pla.decode import kda_mtp_sglang  # noqa: F401
+from pla.prefill.flashkdapro import flashkda_fwd  # noqa: F401
+from pla.decode.kda import fused_kda_decode_mega_forward  # noqa: F401
+
+# tile_kernels: upstream's target.patch intentionally NOT applied (targets
+# upstream tilelang 0.1.14 API; 0.1.8 keeps the legacy path)
+assert md.version("tile_kernels") == "1.0.0", md.version("tile_kernels")
+from tile_kernels.quant import per_token_cast_back  # noqa: F401
+import miles_plugins.models.deepseek_v4.deepseek_v4  # noqa: F401
+
+# miles mooncake path: the transfer engine ships the mooncake_master
+# binary; start_mooncake_master must launch it and return once the port
+# accepts connections.
+import shutil
+assert shutil.which("mooncake_master") is not None, "mooncake_master missing"
+from miles.utils.external_utils.command_utils.ray_backend.command import start_mooncake_master
+import subprocess
+
+start_mooncake_master()
+print("mooncake master launched and ready on 127.0.0.1:50051")
+subprocess.run(["pkill", "-f", "^mooncake_master --rpc_port 50051"], check=False)
+
+# sglang-kernel version gate: the image-wide SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1
+# must bypass the assert or every sglang server launch dies at startup.
+import os
+assert os.environ.get("SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK") == "1", "SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK missing from image env"
+from sglang.srt.utils.common import assert_pkg_version
+assert_pkg_version("sglang-kernel", "0.4.7", "selfcheck")  # must not raise
+print("sglang-kernel version assert bypass active (SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1)")
+
+# miles in-tree adaptation: colocate weight-update IPC per-chunk gloo barrier
+# (libhggc cudaIpcCloseMemHandle spins when ranks' IPC open/close
+# interleave across chunks). AST-level assert that send_bucket's per-chunk
+# release is followed by dist.barrier(group=...).
+import ast as _ast
+_ipc_path = pathlib.Path("/root/miles/miles/backends/training_utils/weight_update/protocols/cuda_ipc.py")
+_ipc_src = _ipc_path.read_text()
+assert "MILES_PATCH_IPC_BARRIER" in _ipc_src, "miles colocate IPC barrier in-tree modification missing"
+_barrier_calls = [
+    n for n in _ast.walk(_ast.parse(_ipc_src))
+    if isinstance(n, _ast.Call)
+    and isinstance(n.func, _ast.Attribute)
+    and n.func.attr == "barrier"
+    and any(
+        isinstance(kw.value, _ast.Attribute) and kw.value.attr == "_ipc_gather_group"
+        for kw in n.keywords
+    )
+]
+assert _barrier_calls, "miles: dist.barrier(group=self._ipc_gather_group) not found in cuda_ipc.py"
+
+# official custom router: the art-source 0.3.2+v0.1.0.ppu2.2.0 must never come
+# back (miles requirements.txt carries sglang-router>=0.2.3) -- its 35-field
+# GenerateRequest silently drops return_routed_experts
+import glob
+import sglang_router
+assert md.version("sglang-router") == "0.3.2", f"sglang-router not the official build: {md.version('sglang-router')}"
+_rso = glob.glob(os.path.join(os.path.dirname(sglang_router.__file__), "*.so"))
+assert _rso, "sglang_router rust extension missing"
+_rbin = pathlib.Path(_rso[0]).read_bytes()
+assert b"return_routed_experts" in _rbin, "router GenerateRequest lacks return_routed_experts"
+assert b"struct GenerateRequest with 51 elements" in _rbin, "router GenerateRequest is not the 51-field miles build"
+assert shutil.which("sgl-model-gateway") is not None, "sgl-model-gateway missing"
+
+# official-image extras: fake_int4 (source build), torchtitan backend deps,
+# kernel set (causal_conv1d drives the miles GDN short conv to fla "mix")
+import fake_int4_quant_cuda  # noqa: F401
+from torchtitan.distributed import ParallelDims  # noqa: F401
+import spmd_types, tyro, torchdata  # noqa: F401,E401
+assert md.version("torchtitan") == "0.3.0", md.version("torchtitan")
+assert md.version("torchdata") == "0.11.0+v0.1.0.ppu2.2.0", md.version("torchdata")
+assert md.version("causal-conv1d") == "1.7.0+v0.1.0.ppu2.2.0", md.version("causal-conv1d")
+assert md.version("mamba-ssm") == "2.3.1+v0.1.0.ppu2.2.0", md.version("mamba-ssm")
+assert md.version("fast-hadamard-transform") == "1.1.0.post2+v0.1.0.ppu2.2.0", md.version("fast-hadamard-transform")
+from miles_plugins.models.linear_attn import short_conv_backend
+assert short_conv_backend() == "mix", f"GDN short conv backend: {short_conv_backend()}"
+
+print(f"torch                   {md.version('torch')} (SDK {_sdk_ver})")
+print(f"sglang                  {md.version('sglang')} (sglang-for-sail v0.5.21 + runtime-port merge + EAGLE oc replay + decode-graph recapture patch in wheel)")
+print(f"megatron-core           {md.version('megatron-core')}")
+print(f"transformer_engine      {md.version('transformer_engine')}")
+print(f"apex                    {md.version('apex')} (int4_qat bundled)")
+print(f"flash-attn              {md.version('flash-attn')} + flash-attn-3 {md.version('flash-attn-3')} (dual)")
+print(f"flash-linear-attention  {md.version('flash-linear-attention')} + fla-core {md.version('fla-core')} (PyPI original, + KDA hoist)")
+print(f"pla                     {md.version('pla')} (linear-attn kernels, sglang rollout)")
+print(f"tile_kernels            {md.version('tile_kernels')} (DeepSeek-V4 qat; target.patch not needed)")
+print(f"deep_ep                 {md.version('deep_ep')} (deepep.py top-level Buffer hard dep)")
+print(f"nvidia-modelopt         {md.version('nvidia-modelopt')} (glm5 plugin import chain)")
+print(f"pyarrow                 {md.version('pyarrow')} (numpy 1.26.4 compat line)")
+print(f"torch_memory_saver      {md.version('torch_memory_saver')} (upstream b5588e83 source build)")
+print(f"sglang-kernel           {md.version('sglang-kernel')} (triton_kernels provider; version assert bypassed)")
+print(f"mbridge                 {md.version('mbridge')}")
+print(f"ray                     {md.version('ray')}")
+print(f"transformers            {transformers.__version__}")
+print(f"miles                   {md.version('miles')} ({pathlib.Path('/root/miles').resolve()})")
+print("miles in-tree adaptations: colocate IPC barrier (ipc-close spin-hang guard) + GPU id sortkey (ray string ids)")
+print(f"mooncake                {md.version('mooncake-transfer-engine')} (transfer engine; master binary ready)")
+print(f"sglang-router           {md.version('sglang-router')} (OFFICIAL miles build, 51-field GenerateRequest w/ return_routed_experts) + sgl-model-gateway")
+print(f"fake_int4_quant_cuda    {md.version('fake_int4_quant_cuda')} (official source, platform nvcc build)")
+print(f"torchtitan              {md.version('torchtitan')} + spmd_types {md.version('spmd_types')} + tyro {md.version('tyro')} + torchdata {md.version('torchdata')}")
+print(f"causal-conv1d           {md.version('causal-conv1d')} (GDN short conv -> {short_conv_backend()}) + mamba-ssm {md.version('mamba-ssm')} + fast-hadamard {md.version('fast-hadamard-transform')}")
+print("All verifications passed.")
+PYEOF
+
+RUN rm -rf /root/.cache/pip /opt/rust/cargo/registry /opt/rust/rustup \
+    /sgl-workspace/sglang/python/build /sgl-workspace/sglang/python/dist \
+    /sgl-workspace/sglang/rust/target \
+    /tmp/fla-src /tmp/sglang-patches /tmp/megatron-bridge /tmp/mbridge /tmp/miles_constraints.txt

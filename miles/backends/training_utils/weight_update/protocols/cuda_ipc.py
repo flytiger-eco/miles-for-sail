@@ -1,3 +1,5 @@
+# Copyright © 2026 Zhejiang Runhe Cloud Intelligence Technology Co., Ltd
+
 import asyncio
 import logging
 from argparse import Namespace
@@ -187,6 +189,11 @@ class UpdateWeightFromTensor(WeightTransferProtocol):
                 futures = (futures or []) + futures_distributed
         check_weight_sync_results(async_utils.wait_futures(futures or []), is_lora=False)
         del long_lived_tensors
+        # MILES_PATCH_IPC_BARRIER: per-chunk gloo barrier after IPC tensor
+        # cleanup -- libhggc cudaIpcCloseMemHandle spins when ranks' IPC
+        # open/close interleave across chunks.
+        if self._ipc_gather_group is not None:
+            dist.barrier(group=self._ipc_gather_group)
 
     def after_engines_resumed(self) -> None:
         torch.cuda.ipc_collect()
