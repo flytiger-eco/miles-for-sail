@@ -65,8 +65,8 @@ ENV RUSTUP_HOME=/opt/rust/rustup \
     PATH="/opt/rust/cargo/bin:${PATH}"
 
 # Build tooling + apt deps (rust extension build requires libssl-dev + protoc)
-# NOTE: unset proxy build-args here -- pip/apt go straight to intranet sources
-#       (reachable without proxy in bridge net); BuildKit re-injects proxy ENV
+# NOTE: unset proxy build-args here -- the base image already points at its
+#       package mirrors; BuildKit re-injects proxy ENV
 #       per RUN, so layers needing direct access must unset it themselves.
 RUN pip install --no-cache-dir \
         setuptools_rust "maturin[patchelf]" uv scikit-build-core \
@@ -78,22 +78,22 @@ RUN pip install --no-cache-dir \
 # Rust toolchain via rustup (toolchains from the rsproxy CN mirror).
 # Cert capture is best-effort, never a gate -- on a clean network it is a
 # no-op; with a MITM proxy, rustup falls back to the proxy path on failure.
-# Crate downloads use crates.io upstream: rsproxy's crate CDN gets throttled
-# to 0B/s by the egress middlebox; [http] cainfo pins the captured bundle.
+# Crate downloads use crates.io upstream (if a mirror CDN stalls, fall back
+# to crates.io); [http] cainfo pins the captured CA bundle.
 RUN set -e; \
     PROXY="${https_proxy:-${http_proxy:-}}"; \
     unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY; \
     mkdir -p /usr/local/share/ca-certificates; \
     capcerts() { d="$1"; shift; timeout 25 openssl s_client -showcerts "$@" </dev/null 2>/dev/null \
         | awk -v d="$d" '/BEGIN CERT/{i++} /BEGIN CERT/,/END CERT/{print > (d i ".crt")}'; }; \
-    capcerts /usr/local/share/ca-certificates/buildnet- \
+    capcerts /usr/local/share/ca-certificates/proxy-ca- \
         -connect rsproxy.cn:443 || true; \
-    if [ ! -e /usr/local/share/ca-certificates/buildnet-1.crt ] && [ -n "$PROXY" ]; then \
+    if [ ! -e /usr/local/share/ca-certificates/proxy-ca-1.crt ] && [ -n "$PROXY" ]; then \
         ph="${PROXY#http://}"; ph="${ph#https://}"; ph="${ph%/}"; \
-        capcerts /usr/local/share/ca-certificates/buildnet- \
+        capcerts /usr/local/share/ca-certificates/proxy-ca- \
             -proxy "$ph" -connect rsproxy.cn:443 || true; \
     fi; \
-    echo "buildnet cert chain captured: $(ls /usr/local/share/ca-certificates/buildnet-*.crt 2>/dev/null | wc -l) cert(s)"; \
+    echo "proxy CA chain captured: $(ls /usr/local/share/ca-certificates/proxy-ca-*.crt 2>/dev/null | wc -l) cert(s)"; \
     update-ca-certificates; \
     export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt; \
     curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs -o /tmp/rustup-init.sh \
@@ -127,7 +127,7 @@ RUN mkdir -p /sgl-workspace \
 # (base = sglang v0.5.21 tag, theirs = sglang-miles b84bec57, ours = sglang-for-sail v0.5.21
 # branch HEAD; 13 conflict blocks auto-resolved, merge-tree/stat pinned inside
 # the script). Applied BEFORE the wheel build so the wheel ships it integrated.
-COPY docker/ppu_patch_sglang_0.5.21/scripts/gen_runtime_port_merge_v012.sh \
+COPY docker/ppu_patch_sglang_0.5.21/scripts/gen_runtime_port_merge_v0.1.2.sh \
      docker/ppu_patch_sglang_0.5.21/pyproject_ppu.toml \
      docker/ppu_patch_sglang_0.5.21/sglang-0002-eagle-draft-oc-replay-oc-restore.patch \
      /tmp/sglang-patches/
@@ -136,7 +136,7 @@ COPY docker/ppu_patch_sglang_0.5.21/scripts/gen_runtime_port_merge_v012.sh \
 # decisive assertion chain
 RUN set -e && cd /sgl-workspace/sglang \
     && GH_PROXY="$http_proxy" SAIL_COMMIT=${SAIL_PIN} WORKDIR=/tmp/portmerge-gen OUT_DIR=/tmp/sglang-patches CLEANUP=1 \
-       bash /tmp/sglang-patches/gen_runtime_port_merge_v012.sh \
+       bash /tmp/sglang-patches/gen_runtime_port_merge_v0.1.2.sh \
     && git apply --check /tmp/sglang-patches/sglang-0001-miles-v0.1.2-runtime-port-ppu-merge.patch \
     && test "$(git apply --numstat /tmp/sglang-patches/sglang-0001-miles-v0.1.2-runtime-port-ppu-merge.patch | wc -l)" = "176" \
     && git apply /tmp/sglang-patches/sglang-0001-miles-v0.1.2-runtime-port-ppu-merge.patch \
@@ -152,9 +152,9 @@ RUN set -e && cd /sgl-workspace/sglang \
 #      fixed upstream in sglang-for-sail v0.5.21; guarded below by the
 #      draft_forward==1 assertion.)
 # md5 note: pinned against the repo copy, which carries the Runhe copyright
-# header (upstream internal fingerprint: f9fd5fdd121cdf32d564207b18450f33).
+# header.
 RUN set -e && cd /sgl-workspace/sglang \
-    && test "$(md5sum /tmp/sglang-patches/sglang-0002-eagle-draft-oc-replay-oc-restore.patch | cut -d' ' -f1)" = "b1bec3b0381530fe83b54e9b24c2a416" \
+    && test "$(md5sum /tmp/sglang-patches/sglang-0002-eagle-draft-oc-replay-oc-restore.patch | cut -d' ' -f1)" = "10d7d463d94d32d2dbf9d25fd3af8454" \
     && git apply --check /tmp/sglang-patches/sglang-0002-eagle-draft-oc-replay-oc-restore.patch \
     && test "$(git apply --numstat /tmp/sglang-patches/sglang-0002-eagle-draft-oc-replay-oc-restore.patch | wc -l)" = "2" \
     && git apply /tmp/sglang-patches/sglang-0002-eagle-draft-oc-replay-oc-restore.patch \
@@ -171,8 +171,7 @@ RUN set -e && cd /sgl-workspace/sglang \
         python/sglang/srt/speculative/eagle_worker_v2.py \
         python/sglang/srt/managers/scheduler_components/weight_updater.py
 
-# Activate the platform pyproject variant (the public mirror strips internal-only
-# files) + local version tag for setuptools-scm
+# Activate the platform pyproject variant + local version tag for setuptools-scm
 RUN cd /sgl-workspace/sglang \
     && cp python/pyproject.toml python/pyproject.toml.orig \
     && cp /tmp/sglang-patches/pyproject_ppu.toml python/pyproject.toml \
@@ -181,7 +180,7 @@ RUN cd /sgl-workspace/sglang \
 
 # Build the wheel (3 rust extensions; ~15 min). `uv build` hangs resolving
 # pyproject's pypi.org index in-network - use `python -m build`. Proxy unset:
-# cargo reaches rsproxy.cn directly; the buildnet MITM CA (if any) is handled
+# cargo reaches rsproxy.cn directly; the proxy CA (if any) is handled
 # by the [http] cainfo in /opt/rust/cargo/config.toml above.
 RUN unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY \
     && cd /sgl-workspace/sglang/python \
@@ -193,6 +192,11 @@ RUN pip install --force-reinstall --no-deps /sgl-workspace/sglang/python/dist/sg
     python3 -c "import importlib.metadata as im; assert im.version('sglang') == '0.5.21', im.version('sglang')"
 # NOTE: metadata-only assertion on purpose -- deep imports pull in regular deps
 # installed later; deep checks live in the post-deps check RUN below.
+
+# Strip the build-time proxy CA from the final image: it was only needed by
+# cargo during the wheel build above.
+RUN rm -f /usr/local/share/ca-certificates/proxy-ca-*.crt \
+    && update-ca-certificates --fresh
 
 # Kernel ecosystem (flytiger art source resolves platform-customized builds)
 RUN pip install "tilelang==0.1.8" "deep_gemm>=1.1.0" flash_mla "acext>=1.1.0" && \

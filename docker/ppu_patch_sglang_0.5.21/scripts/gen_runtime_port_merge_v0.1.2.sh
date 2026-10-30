@@ -2,7 +2,7 @@
 # Copyright © 2026 Zhejiang Runhe Cloud Intelligence Technology Co., Ltd
 
 # =============================================================================
-# gen_runtime_port_merge_v012.sh
+# gen_runtime_port_merge_v0.1.2.sh
 # miles-sail v0.1.2 runtime-port patch regeneration (fully automated and
 # self-contained; runs anywhere with git/python3 + public network access).
 #
@@ -27,7 +27,7 @@
 #   - git >= 2.30
 #
 # Environment variables (optional):
-#   WORKDIR     working directory (default /tmp/portmerge-v012-gen; holds the clone and the worktree)
+#   WORKDIR     working directory (default /tmp/portmerge-v0.1.2-gen; holds the clone and the worktree)
 #   OUT_DIR     patch output directory (default <script dir>/../patches)
 #   REF_DIR     reference directory: byte-wise cmp against same-named patches when present (default empty = skip)
 #   GH_PROXY    http proxy URL (e.g. http://host:port; default empty = direct connection)
@@ -66,7 +66,7 @@ RAW_NAME=sglang-0001-miles-v0.1.2-runtime-port.patch
 MERGE_NAME=sglang-0001-miles-v0.1.2-runtime-port-ppu-merge.patch
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
-WORKDIR=${WORKDIR:-/tmp/portmerge-v012-gen}
+WORKDIR=${WORKDIR:-/tmp/portmerge-v0.1.2-gen}
 OUT_DIR=${OUT_DIR:-$SCRIPT_DIR/../patches}
 REF_DIR=${REF_DIR:-}
 APPLY_CHECK=${APPLY_CHECK:-1}
@@ -90,7 +90,7 @@ fetch_retry() {
 }
 
 mkdir -p "$OUT_DIR"
-echo "== gen_runtime_port_merge_v012 =="
+echo "== gen_runtime_port_merge_v0.1.2 =="
 echo "   WORKDIR=$WORKDIR  OUT_DIR=$OUT_DIR  REF_DIR=${REF_DIR:-<none>}"
 
 # ============================================================================
@@ -169,9 +169,7 @@ cd "$WT"
 
 # The committer identity must be configured BEFORE the merge (repo-local; the
 # worktree shares the main repo config): git merge --no-commit still prepares
-# the merge commit and fatals with exit 128 without an identity (observed in
-# build-layer testing: the v012 container survived via its global git config;
-# a clean environment exposed it)
+# the merge commit and fatals with exit 128 without an identity.
 git config user.name "miles-sail-build"
 git config user.email "miles-sail-build@users.noreply.github.com"
 
@@ -209,7 +207,7 @@ echo "   merge conflicts: $CONFLICT_COUNT files / 13 blocks (as expected)"
 # ============================================================================
 # Phase 4: auto-resolve 13 conflict blocks (embedded resolver; per file, in block order; keep both sides)
 # ============================================================================
-cat > "$WORKDIR/resolve_conflicts_v012.py" <<'PYEOF'
+cat > "$WORKDIR/resolve_conflicts_v0.1.2.py" <<'PYEOF'
 #!/usr/bin/env python3
 """v0.1.2 A' three-way merge conflict resolution (13 blocks, strategy: keep both sides).
 
@@ -234,7 +232,7 @@ Fusion principles:
 import os
 import sys
 
-ROOT = os.environ.get("PORTMERGE_ROOT", "/tmp/portmerge-v012/python/sglang")
+ROOT = os.environ.get("PORTMERGE_ROOT", "/tmp/portmerge-v0.1.2/python/sglang")
 
 
 def resolve(path, solutions):
@@ -618,7 +616,7 @@ if __name__ == "__main__":
     main()
 PYEOF
 
-PORTMERGE_ROOT=$WT/python/sglang python3 "$WORKDIR/resolve_conflicts_v012.py"
+PORTMERGE_ROOT=$WT/python/sglang python3 "$WORKDIR/resolve_conflicts_v0.1.2.py"
 
 # Syntax-check the 8 files (same ast.parse all-green requirement as the offline flow)
 SAIL_BRANCH_REF="sglang-for-sail/$SAIL_BRANCH" python3 - <<'PYAST'

@@ -86,7 +86,7 @@ diff --git a/python/sglang/srt/managers/scheduler_components/weight_updater.py b
 +            # (b) EAGLE draft graphs (draft decode + draft extend): owned by
 +            # the spec worker itself (self.draft_worker is the EagleWorker),
 +            # NOT by the inner draft model_runner, so init_decode_cuda_graph
-+            # on the draft runner does not cover them. r4 crashed exactly in
++            # on the draft runner does not cover them. observed: crash in
 +            # eagle_draft_cuda_graph_runner._replay.
 +            _dw = getattr(self.draft_worker, "_draft_worker", None)
 +            if _dw is None:
