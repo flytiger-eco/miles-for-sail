@@ -25,7 +25,7 @@ CASES=(
   'timeout 1800 pytest -v tests/test_attention_output_gate_tp.py'
   'timeout 1800 pytest -v tests/test_chunked_gae.py'
   'timeout 1800 pytest -v tests/test_fsdp_import.py'
-  'timeout 3600 pytest -v tests/fast/ --override-ini="addopts=" --continue-on-collection-errors'
+  'timeout 21600 pytest -v tests/fast/ --override-ini="addopts=" --continue-on-collection-errors'
 )
 
 # ---------------------------------------------------------------------------

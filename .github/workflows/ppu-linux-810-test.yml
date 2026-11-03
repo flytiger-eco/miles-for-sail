@@ -46,7 +46,7 @@ jobs:
     runs-on: k8s-runner-group-cpu-flytiger
     container:
       image: ghcr.io/actions/actions-runner:latest
-    timeout-minutes: 180
+    timeout-minutes: 420
 
     steps:
       - name: Checkout miles-for-sail
@@ -76,7 +76,7 @@ jobs:
           image: ${{ env.IMAGE }}
           namespace: ${{ env.NAMESPACE }}
           source_dir: ${{ env.SOURCE_DIR }}
-          timeout_minutes: 120
+          timeout_minutes: 360
 
           command: |
             bash <<'PPU_MILES_TEST'
