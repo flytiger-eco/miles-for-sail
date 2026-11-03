@@ -82,6 +82,10 @@ jobs:
             bash <<'PPU_MILES_TEST'
             set -uo pipefail
             cd "${{ env.SOURCE_DIR }}"
+            # git in the pod sees the unpacked checkout as a foreign owner
+            # ("dubious ownership", exit 128); tests that shell out to git
+            # need this to pass.
+            git config --global --add safe.directory "${PWD}" || true
             echo "=== environment self-check ==="
             echo "hostname=$(hostname) node=${NODE_NAME:-unknown}"
             python --version
@@ -89,5 +93,7 @@ jobs:
             ppu-smi || echo "[warn] ppu-smi unavailable; check PPU device allocation of the pod"
             echo "=== run miles PPU test case set ==="
             bash .github/scripts/ppu/run_test_cases.sh
-            echo "[ppu-miles-test] done"
+            rc=$?
+            echo "[ppu-miles-test] done (exit=$rc)"
+            exit $rc
             PPU_MILES_TEST
