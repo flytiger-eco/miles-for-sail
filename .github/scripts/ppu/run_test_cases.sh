@@ -22,9 +22,21 @@ export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
 # reason: on the v0.1.2 image every [agentic_tool_call] variant of
 # test_multi_turn.py fails after ~6 minutes of HTTP retries (60 retries
 # x (5s request timeout + 1s sleep) in miles/utils/http_utils.py), and the
-# first case of test_agentic_v2.py hangs indefinitely, stalling the whole
-# suite until the pod budget kills it. Both passed on the v0.1.0 image.
-# Re-enable after the shared HTTP client triage lands upstream.
+# first cases of test_agentic_v2.py / inference_rollout hang indefinitely,
+# stalling the whole suite until the pod budget kills it. Both passed on
+# the v0.1.0 image. Re-enable after the shared HTTP client triage lands
+# upstream.
+#
+# tests/fast/ is split into per-directory cases so a single hung case
+# only burns its own group budget (timeout 124 -> FAIL) instead of the
+# whole pod: two full-suite runs in a row stalled ~5h in rollout/
+# integration tests and were killed by the pod budget with 65% of the
+# suite never reached. Keep the per-group timeouts well under the pod
+# budget: the pod 6h window counts from job start (scheduling included),
+# so a 21600s group timeout can never fire first. The known-risky rollout
+# group runs last so the verified directories collect results first.
+# -k "not agentic_tool_call" is applied to every group because the
+# router session-samples suites carry the same variant name.
 CASES=(
   'timeout 1800 pytest -v tests/ci/test/ -k "not test_no_test_file_lives_outside_the_tests_tree"'
   'timeout 1800 pytest -v tests/fast-gpu/test_det_process_group.py'
@@ -33,7 +45,14 @@ CASES=(
   'timeout 1800 pytest -v tests/test_attention_output_gate_tp.py'
   'timeout 1800 pytest -v tests/test_chunked_gae.py'
   'timeout 1800 pytest -v tests/test_fsdp_import.py'
-  'timeout 21600 pytest -v tests/fast/ --override-ini="addopts=" --continue-on-collection-errors --ignore=tests/fast/rollout/generate_hub/test_agentic_v2.py -k "not agentic_tool_call"'
+  'timeout 1800 pytest -v tests/fast/e2e --override-ini="addopts=" --continue-on-collection-errors -k "not agentic_tool_call"'
+  'timeout 1800 pytest -v tests/fast/examples --override-ini="addopts=" --continue-on-collection-errors -k "not agentic_tool_call"'
+  'timeout 1800 pytest -v tests/fast/ray --override-ini="addopts=" --continue-on-collection-errors -k "not agentic_tool_call"'
+  'timeout 1800 pytest -v tests/fast/backends --override-ini="addopts=" --continue-on-collection-errors -k "not agentic_tool_call"'
+  'timeout 2400 pytest -v tests/fast/charts tests/fast/dashboard tests/fast/doc tests/fast/launch_scripts tests/fast/miles_plugins tests/fast/models tests/fast/optimizers tests/fast/scripts tests/fast/tinker tests/fast/tools tests/fast/true_on_policy --override-ini="addopts=" --continue-on-collection-errors -k "not agentic_tool_call"'
+  'timeout 1800 pytest -v tests/fast/router --override-ini="addopts=" --continue-on-collection-errors -k "not agentic_tool_call"'
+  'timeout 3600 pytest -v tests/fast/utils --override-ini="addopts=" --continue-on-collection-errors -k "not agentic_tool_call"'
+  'timeout 3600 pytest -v tests/fast/rollout --override-ini="addopts=" --continue-on-collection-errors --ignore=tests/fast/rollout/generate_hub/test_agentic_v2.py -k "not agentic_tool_call"'
 )
 
 # ---------------------------------------------------------------------------
