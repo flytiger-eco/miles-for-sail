@@ -24,8 +24,9 @@ export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
 #   - every [agentic_tool_call] variant of generate_hub/test_multi_turn.py
 #     fails after ~6 minutes (60 retries x (5s timeout + 1s sleep) in
 #     miles/utils/http_utils.py), while the [multi_turn] variants pass;
-#   - test_agentic_v2.py and the inference_rollout/ integration tests
-#     hang indefinitely.
+#   - test_agentic_v2.py and the whole inference_rollout/ integration
+#     directory hang indefinitely (observed on the rollout group run:
+#     exit=124 after the full 2h timeout with no further output).
 # Both passed on the v0.1.0 image. Re-enable after the upstream triage.
 #
 # tests/fast/ is split into per-directory groups so a single hung case
@@ -47,7 +48,7 @@ CASES=(
   'timeout 7200 pytest -v tests/fast/charts tests/fast/dashboard tests/fast/doc tests/fast/launch_scripts tests/fast/miles_plugins tests/fast/models tests/fast/optimizers tests/fast/scripts tests/fast/tinker tests/fast/tools tests/fast/true_on_policy --override-ini="addopts=" --continue-on-collection-errors -k "not agentic_tool_call"'
   'timeout 7200 pytest -v tests/fast/router --override-ini="addopts=" --continue-on-collection-errors -k "not agentic_tool_call"'
   'timeout 7200 pytest -v tests/fast/utils --override-ini="addopts=" --continue-on-collection-errors -k "not agentic_tool_call"'
-  'timeout 7200 pytest -v tests/fast/rollout --override-ini="addopts=" --continue-on-collection-errors --ignore=tests/fast/rollout/generate_hub/test_agentic_v2.py -k "not agentic_tool_call"'
+  'timeout 7200 pytest -v tests/fast/rollout --override-ini="addopts=" --continue-on-collection-errors --ignore=tests/fast/rollout/generate_hub/test_agentic_v2.py --ignore=tests/fast/rollout/inference_rollout -k "not agentic_tool_call"'
 )
 
 # ---------------------------------------------------------------------------
