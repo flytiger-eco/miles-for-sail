@@ -17,6 +17,14 @@ export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
 # concurrency is reset between cases"), and its remaining selected case
 # (test_max_concurrent[limit_1]) hangs on the v0.1.2 image. Re-enable it
 # in both suites after triage.
+#
+# The agentic rollout surface is excluded from tests/fast/ for the same
+# reason: on the v0.1.2 image every [agentic_tool_call] variant of
+# test_multi_turn.py fails after ~6 minutes of HTTP retries (60 retries
+# x (5s request timeout + 1s sleep) in miles/utils/http_utils.py), and the
+# first case of test_agentic_v2.py hangs indefinitely, stalling the whole
+# suite until the pod budget kills it. Both passed on the v0.1.0 image.
+# Re-enable after the shared HTTP client triage lands upstream.
 CASES=(
   'timeout 1800 pytest -v tests/ci/test/ -k "not test_no_test_file_lives_outside_the_tests_tree"'
   'timeout 1800 pytest -v tests/fast-gpu/test_det_process_group.py'
@@ -25,7 +33,7 @@ CASES=(
   'timeout 1800 pytest -v tests/test_attention_output_gate_tp.py'
   'timeout 1800 pytest -v tests/test_chunked_gae.py'
   'timeout 1800 pytest -v tests/test_fsdp_import.py'
-  'timeout 21600 pytest -v tests/fast/ --override-ini="addopts=" --continue-on-collection-errors'
+  'timeout 21600 pytest -v tests/fast/ --override-ini="addopts=" --continue-on-collection-errors --ignore=tests/fast/rollout/generate_hub/test_agentic_v2.py -k "not agentic_tool_call"'
 )
 
 # ---------------------------------------------------------------------------
