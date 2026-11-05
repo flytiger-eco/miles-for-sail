@@ -49,6 +49,11 @@ export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
 # only burns its own group. The -k "not agentic_tool_call" filter is
 # applied to every group because the router session-samples suites
 # carry the same variant name.
+#
+# The root-level tests/fast/test_*.py files are enumerated explicitly
+# (shell glob, 21 files): pytest's norecursedirs-based collection does
+# not pick them up from a directory target, so a dedicated group keeps
+# the core training/platform-contract unit tests in the run.
 CASES=(
   'timeout 7200 pytest -v tests/ci/test/ -k "not test_no_test_file_lives_outside_the_tests_tree"'
   'timeout 7200 pytest -v tests/fast-gpu/test_det_process_group.py'
@@ -62,6 +67,7 @@ CASES=(
   'timeout 7200 pytest -v tests/fast/ray --override-ini="addopts=" --continue-on-collection-errors -k "not agentic_tool_call"'
   'timeout 7200 pytest -v tests/fast/backends --override-ini="addopts=" --continue-on-collection-errors -k "not agentic_tool_call"'
   'timeout 7200 pytest -v tests/fast/charts tests/fast/dashboard tests/fast/doc tests/fast/launch_scripts tests/fast/miles_plugins tests/fast/models tests/fast/optimizers tests/fast/scripts tests/fast/tinker tests/fast/tools tests/fast/true_on_policy --override-ini="addopts=" --continue-on-collection-errors -k "not agentic_tool_call"'
+  'timeout 7200 pytest -v tests/fast/test_*.py --override-ini="addopts=" --continue-on-collection-errors -k "not agentic_tool_call"'
   'timeout 7200 pytest -v tests/fast/router --override-ini="addopts=" --continue-on-collection-errors --ignore=tests/fast/router/test_session_anthropic.py --ignore=tests/fast/router/test_sessions.py --ignore=tests/fast/router/test_sessions_v2.py --ignore=tests/fast/router/test_session_request_args.py --ignore=tests/fast/router/test_sessions_v1_pins.py --ignore=tests/fast/router/test_session_race_conditions.py --ignore=tests/fast/router/test_session_v1_v2_parity.py --ignore=tests/fast/router/test_sglang_anthropic_conversion.py -k "not agentic_tool_call"'
   'timeout 7200 pytest -v tests/fast/utils --override-ini="addopts=" --continue-on-collection-errors --ignore=tests/fast/utils/lora/test_hf_lora_model_targets.py --ignore=tests/fast/utils/workers/real_ray/test_serve_actor_rpc.py -k "not (agentic_tool_call or test_every_secret_looking_miles_flag_is_either_redacted_or_declared_harmless or test_expands_the_model_config_into_the_submitted_command)"'
   'timeout 7200 pytest -v tests/fast/rollout --override-ini="addopts=" --continue-on-collection-errors --ignore=tests/fast/rollout/generate_hub/test_agentic_v2.py --ignore=tests/fast/rollout/inference_rollout -k "not agentic_tool_call"'
