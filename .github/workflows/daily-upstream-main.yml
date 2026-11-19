@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       publish:
-        description: Open a synchronization PR (only allowed from main)
+        description: Open a synchronization PR (manual dispatches only; scheduled runs publish automatically from main)
         type: boolean
         default: false
   schedule:
@@ -87,19 +87,20 @@ jobs:
             exit "$merge_status"
           fi
           [[ "$(git rev-parse MERGE_HEAD)" == "$UPSTREAM_SHA" ]] || exit 1
-          # The target branch keeps a clean upstream snapshot, so conflicts are
-          # not expected. Track them anyway: Copilot is only invoked when the
-          # conflict list is non-empty, and special conflicts always go to a human.
-          if [[ -s "$RUNNER_TEMP/sync-conflicts" ]]; then
-            printf 'has_conflicts=true\n' >> "$GITHUB_OUTPUT"
-          else
-            printf 'has_conflicts=false\n' >> "$GITHUB_OUTPUT"
-          fi
           # Protect all local workflows, including upstream additions and deletions.
           # Only the index is restored; disposable worktree leftovers are not committed.
           git restore --source="$BASE_SHA" --staged -- .github/workflows
           git diff --cached --quiet "$BASE_SHA" -- .github/workflows || exit 1
           git diff --name-only --diff-filter=U -z > "$RUNNER_TEMP/sync-conflicts"
+          # The target branch keeps a clean upstream snapshot, so conflicts are
+          # not expected. Compute the gate from the refreshed conflict list so
+          # workflow-only conflicts cleared by the restore do not invoke Copilot
+          # with an empty evidence set.
+          if [[ -s "$RUNNER_TEMP/sync-conflicts" ]]; then
+            printf 'has_conflicts=true\n' >> "$GITHUB_OUTPUT"
+          else
+            printf 'has_conflicts=false\n' >> "$GITHUB_OUTPUT"
+          fi
           git ls-files --stage -z > "$RUNNER_TEMP/sync-index"
           BASE_SHA="$BASE_SHA" UPSTREAM_SHA="$UPSTREAM_SHA" python3 -I - <<'PY'
           import json
@@ -353,12 +354,14 @@ jobs:
           retention-days: 7
 
       - name: Report dry-run mode
-        if: steps.merge.outputs.changed == 'true' && !(inputs.publish && github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'))
+        # Scheduled events never populate inputs.publish; let them publish on
+        # their own while manual dispatches require an explicit publish input.
+        if: steps.merge.outputs.changed == 'true' && !((github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.publish)) && github.ref == 'refs/heads/main')
         run: echo 'Dry-run only; no branch was pushed and no synchronization PR was created.' >> "$GITHUB_STEP_SUMMARY"
 
   publish:
     needs: merge
-    if: needs.merge.outputs.changed == 'true' && github.repository == 'flytiger-eco/miles-for-sail' && inputs.publish && github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    if: needs.merge.outputs.changed == 'true' && github.repository == 'flytiger-eco/miles-for-sail' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.publish)) && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -380,9 +383,14 @@ jobs:
         id: publish
         shell: bash
         env:
+          # Built-in-token PRs never trigger downstream Actions, which keeps
+          # generated draft PRs isolated until human review. An optional
+          # repository-scoped SYNC_PR_TOKEN lets them trigger downstream CI
+          # before that review; configure it only after evaluating what those
+          # PRs run on this repository's CI policy chain.
           GH_TOKEN: ${{ secrets.SYNC_PR_TOKEN || github.token }}
           CUSTOM_PR_TOKEN_CONFIGURED: ${{ secrets.SYNC_PR_TOKEN != '' }}
-          PUBLISH_REQUESTED: ${{ inputs.publish }}
+          PUBLISH_REQUESTED: ${{ github.event_name == 'schedule' || inputs.publish }}
         run: |
           set -euo pipefail
           [[ "$PUBLISH_REQUESTED" == 'true' ]] || exit 1
@@ -465,5 +473,5 @@ jobs:
           fi
           printf 'Draft synchronization PR awaiting human review: %s\n' "$PR_URL" >> "$GITHUB_STEP_SUMMARY"
           if [[ "$CUSTOM_PR_TOKEN_CONFIGURED" != 'true' ]]; then
-            echo '::warning::Built-in-token PRs do not trigger other Actions. Trigger checks manually or configure optional SYNC_PR_TOKEN.'
+            echo '::warning::Built-in-token PRs do not trigger other Actions. Trigger checks manually, or configure optional SYNC_PR_TOKEN after reviewing the downstream CI chain those PRs would run.'
           fi
