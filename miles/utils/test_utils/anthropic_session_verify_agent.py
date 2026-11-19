@@ -19,6 +19,7 @@ from miles.utils.test_utils.session_verify_agent import (
     SYSTEM_REMINDER_TEXT,
     TOOLS,
     USER_FOLLOWUP_TEXT,
+    SessionVerifyKind,
     _journal_verifier_assertions,
     _verify_tito_samples,
     fixed_template_append_roles,
@@ -332,10 +333,12 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
 
     samples = output.samples if isinstance(output.samples, list) else [output.samples]
     events_per_sample = [sample.metadata.get("driver_events", []) for sample in samples]
-    allowed_roles = list(fixed_template_append_roles(tito_model))
-    _verify_tito_samples(samples, events_per_sample, allowed_roles=allowed_roles)
+    _verify_tito_samples(samples, kind=SessionVerifyKind.NORMAL)
     if len(samples) != 1:
-        raise AssertionError(f"Anthropic per-model e2e: expected one linear sample, got {len(samples)}")
+        raise AssertionError(
+            f"Anthropic per-model e2e: expected one linear sample, got {len(samples)}; "
+            f"leaves={[sample.metadata.get('leaf') for sample in samples]!r}"
+        )
     include_system = samples[0].metadata.get("intermediate_system_used")
     if type(include_system) is not bool:
         raise AssertionError("Anthropic per-model e2e: missing intermediate-system capability result")

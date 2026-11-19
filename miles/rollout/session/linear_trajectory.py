@@ -1,20 +1,20 @@
 import asyncio
 import logging
 import uuid
-from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from miles.rollout.session.config import SessionServerConfig
 from miles.rollout.session.errors import MessageValidationError, SessionNotFoundError, TokenizationError
 from miles.rollout.session.request_args import PreparedChatRequest, prepare_chat_request
+from miles.rollout.session.store_refs import SessionStoreRefs
 from miles.rollout.session.types import SessionRecord
 from miles.utils.chat_template_utils.message_matcher_hub import (
     SessionMessageMatcher,
     assert_messages_append_only_with_allowed_role,
     strict_message_matches,
 )
-from miles.utils.chat_template_utils.tito_tokenizer import TITOTokenizer, extract_template_args
+from miles.utils.chat_template_utils.tito_tokenizer import FixedTemplate, TITOTokenizer, extract_template_args
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +56,31 @@ def assert_pretokenized_prefix(
         )
 
 
+def assert_continuation_roles(
+    messages: list[dict[str, Any]], *, appended_from: int, fixed_template: FixedTemplate
+) -> None:
+    """Refuse an appended message that may not directly follow its assistant.
+
+    Each message in ``messages[appended_from:]`` that directly follows an
+    assistant must take a role in ``fixed_template.roles_after`` that assistant,
+    decided by whether it carries ``tool_calls``. Checked before rendering, so
+    a refusal is a 400 and leaves session state unchanged. Shared verbatim by
+    the v1 render and the v2 render.
+    """
+    for index in range(max(appended_from, 1), len(messages)):
+        previous = messages[index - 1]
+        if previous.get("role") != "assistant":
+            continue
+        role = messages[index].get("role")
+        allowed = fixed_template.roles_after(previous)
+        if role not in allowed:
+            calls = "with" if previous.get("tool_calls") else "without"
+            raise MessageValidationError(
+                f"appended message at index {index} has role={role!r} after an assistant {calls} tool_calls; "
+                f"the selected TITO family accepts only {sorted(allowed)} there"
+            )
+
+
 @dataclass
 class LinearTrajectory:
     """State for a linear trajectory.
@@ -70,7 +95,9 @@ class LinearTrajectory:
     but the agent may retry from an earlier point (e.g. re-running a tool call),
     in which case the session is rolled back at most one assistant step.
 
-    ``turn_args_history`` stores each successful generation's full resolved request.
+    ``turn_args_history`` stores each successful generation's full resolved request
+    by reference: every turn builds a fresh request and nothing mutates it once
+    the turn is committed, so no per-turn copy of its ``input_ids`` and ``messages``.
     Rollback slices it with the token checkpoints. Model rules decide which of
     these fields a continuation inherits or must keep unchanged.
 
@@ -82,6 +109,7 @@ class LinearTrajectory:
 
     lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False, compare=False)
     closing: bool = field(default=False, repr=False, compare=False)
+    store_refs: SessionStoreRefs = field(default_factory=SessionStoreRefs, repr=False, compare=False)
     messages: list[dict[str, Any]] = field(default_factory=list)
     records: list[SessionRecord] = field(default_factory=list)
     trajectory_token_ids: list[list[int]] = field(default_factory=list)
@@ -91,6 +119,17 @@ class LinearTrajectory:
     evaluation: bool = False
     sampling_defaults: dict[str, Any] = field(default_factory=dict)
     sampling_support_replay: bool = False
+
+    def snapshot(self) -> "LinearTrajectory":
+        """Copy the mutable containers, sharing committed payloads read-only. Caller holds the lock."""
+        return replace(
+            self,
+            messages=list(self.messages),
+            records=list(self.records),
+            trajectory_token_ids=list(self.trajectory_token_ids),
+            generated_checkpoint_message_ends=list(self.generated_checkpoint_message_ends),
+            turn_args_history=list(self.turn_args_history),
+        )
 
     @property
     def turn_args(self) -> dict[str, Any]:
@@ -195,6 +234,9 @@ class LinearTrajectory:
             ) from e
 
         effective_messages = stored_messages + request_messages[len(stored_messages) :]
+        assert_continuation_roles(
+            effective_messages, appended_from=len(stored_messages), fixed_template=tito_tokenizer.FIXED_TEMPLATE
+        )
         return tito_tokenizer.merge_tokens(
             old_messages=stored_messages,
             new_messages=effective_messages,
@@ -235,7 +277,7 @@ class LinearTrajectory:
         # no longer match its own session.
         self.messages = self.messages + request_messages[len(self.messages) :] + [assistant_message]
         self.trajectory_token_ids.append(all_token_ids)
-        self.turn_args_history.append(deepcopy(turn_args or {}))
+        self.turn_args_history.append(turn_args or {})
         self.generated_checkpoint_message_ends.append(len(request_messages) + 1)
         self.num_assistant = len(self.generated_checkpoint_message_ends)
 
@@ -390,7 +432,12 @@ class SessionRegistry:
         evaluation: bool = False,
         sampling_defaults: dict[str, Any] | None = None,
         sampling_support_replay: bool = False,
+        extra_key: str | None = None,
     ) -> str:
+        assert extra_key is None, (
+            f"session server v1 does not support the KV cache namespace {extra_key!r}; "
+            f"run with --use-session-server v2"
+        )
         session_id = uuid.uuid4().hex
         self.sessions[session_id] = LinearTrajectory(
             evaluation=evaluation,

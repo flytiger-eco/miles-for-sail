@@ -22,6 +22,7 @@ from miles.utils.test_utils.uvicorn_thread_server import UvicornThreadServer
 class ProcessResultMetaInfo:
     weight_version: str | None = None
     weight_versions: list[dict[str, str | int]] | None = None
+    prefill_weight_versions: list[dict[str, str | int]] | None = None
     routed_experts: str | None = None
     spec_num_correct_drafts: int | None = None
     spec_num_proposed_drafts: int | None = None
@@ -138,7 +139,11 @@ class MockSGLangServer:
             **process_result.meta_info.to_dict(),
         }
 
-        return {"text": process_result.text, "meta_info": meta_info}
+        response = {"text": process_result.text, "meta_info": meta_info}
+        if payload.get("return_prompt_token_ids"):
+            # The mock expands nothing, so the prompt comes back as sent.
+            response["prompt_token_ids"] = list(input_ids)
+        return response
 
     def _compute_chat_completions_response(self, payload: dict) -> dict:
         messages = payload.get("messages", [])
@@ -170,7 +175,8 @@ class MockSGLangServer:
 
         finish_reason = process_result.finish_reason
         tool_calls = None
-        if tools and finish_reason == "stop":
+        # Like SGLang, tool_choice "none" leaves a tool call in content unparsed.
+        if tools and payload.get("tool_choice") != "none" and finish_reason == "stop":
             parser = FunctionCallParser(
                 tools=TypeAdapter(list[Tool]).validate_python(tools),
                 tool_call_parser="qwen25",

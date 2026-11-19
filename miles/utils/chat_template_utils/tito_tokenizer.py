@@ -20,6 +20,7 @@ except ImportError:
 from pathlib import Path
 from typing import Any
 
+from miles.rollout.session.errors import MessageValidationError
 from miles.utils.chat_template_utils import deepseek, template
 from miles.utils.chat_template_utils.inkling_parser import InklingResponseParser
 from miles.utils.chat_template_utils.message_matcher_hub import (
@@ -41,6 +42,17 @@ VALID_APPEND_ROLES: tuple[str, ...] = ("tool", "user", "system", "assistant")
 ALL_APPEND_ROLES: frozenset[str] = frozenset(VALID_APPEND_ROLES)
 
 _DUMMY_SYSTEM: dict[str, Any] = {"role": "system", "content": "dummy system"}
+_DUMMY_USER: dict[str, Any] = {"role": "user", "content": "dummy user"}
+
+
+def _continuation_roles(name: str, value: frozenset[str] | None, allowed: frozenset[str]) -> frozenset[str]:
+    """A continuation-role field, defaulting to *allowed* and bounded by it."""
+    roles = allowed if value is None else frozenset(value)
+    if not roles <= allowed:
+        raise ValueError(
+            f"FixedTemplate {name} {sorted(roles - allowed)} are outside allowed_append_roles {sorted(allowed)}"
+        )
+    return roles
 
 
 @dataclass(frozen=True)
@@ -54,12 +66,22 @@ class FixedTemplate:
     four-role surface; a known restricted template must narrow it explicitly.
     ``consistant_kwargs`` lists fields that must retain their recorded value
     or absence when continuing a turn.
+
+    ``roles_after_tool_call`` and ``roles_after_no_tool_call`` are the roles
+    the runtime accepts directly after an assistant message with and without
+    ``tool_calls``.  Both default to ``allowed_append_roles``; a family whose
+    renderer refuses a continuation narrows them.  They state what the session
+    server accepts when a request appends to a stored history, which can be
+    wider than what the model was trained on; a from-scratch render is left to
+    the renderer.
     """
 
     template: str | None = None
     extra_kwargs: dict[str, Any] = field(default_factory=dict)
     allowed_append_roles: frozenset[str] = ALL_APPEND_ROLES
     consistant_kwargs: list[str] = field(default_factory=list)
+    roles_after_tool_call: frozenset[str] | None = None
+    roles_after_no_tool_call: frozenset[str] | None = None
 
     def __post_init__(self) -> None:
         roles = frozenset(self.allowed_append_roles)
@@ -70,6 +92,26 @@ class FixedTemplate:
                 f"supported roles are {sorted(ALL_APPEND_ROLES)}"
             )
         object.__setattr__(self, "allowed_append_roles", roles)
+        object.__setattr__(
+            self,
+            "roles_after_tool_call",
+            _continuation_roles("roles_after_tool_call", self.roles_after_tool_call, roles),
+        )
+        object.__setattr__(
+            self,
+            "roles_after_no_tool_call",
+            _continuation_roles("roles_after_no_tool_call", self.roles_after_no_tool_call, roles),
+        )
+        if "tool" not in self.roles_after_tool_call:
+            raise ValueError(
+                "FixedTemplate roles_after_tool_call must allow the 'tool' messages that answer the calls"
+            )
+
+    def roles_after(self, assistant_message: dict[str, Any]) -> frozenset[str]:
+        """The roles that may directly follow *assistant_message*."""
+        if assistant_message.get("tool_calls"):
+            return self.roles_after_tool_call
+        return self.roles_after_no_tool_call
 
 
 def extract_template_args(request_args: dict[str, Any]) -> dict[str, Any]:
@@ -90,6 +132,13 @@ def _build_dummy_assistant(stored_assistant: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _from_last_assistant(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """*messages* from the last assistant turn on, behind a dummy user turn; all of
+    them when there is no assistant turn."""
+    last = max((i for i, message in enumerate(messages) if message.get("role") == "assistant"), default=None)
+    return messages if last is None else [_DUMMY_USER, *messages[last:]]
+
+
 # ---------------------------------------------------------------------------
 # Base / default tokenizer
 # ---------------------------------------------------------------------------
@@ -101,6 +150,9 @@ class TITOTokenizer:
 
     max_trim_tokens: int = 0
     trailing_token_ids: frozenset[int] = frozenset()
+    # Family default for ``--allow-stop-token-replace``: whether ``merge_tokens`` may replace
+    # the sampled stop token with a different first token of the appended render.
+    allow_stop_token_replace: bool = False
 
     # The family's fixed renderer contract. DEFAULT uses the model's native
     # template with the maximal best-effort append surface.
@@ -110,6 +162,10 @@ class TITOTokenizer:
     # this family.
     reasoning_parser: str | None = None
     tool_call_parser: str | None = None
+
+    # Keys ``postprocess_completion`` adds to a stored assistant message for later
+    # renders; a client replaying that turn does not send them back.
+    SERVER_MESSAGE_KEYS: tuple[str, ...] = ()
 
     def __init__(
         self,
@@ -277,8 +333,17 @@ class TITOTokenizer:
         stored_messages: list[dict[str, Any]],
         request_messages: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        """Restore model-specific server-owned sidecars after client replay."""
-        return list(request_messages)
+        """Restore the ``SERVER_MESSAGE_KEYS`` a client drops when it replays a stored assistant turn."""
+        preserved = list(request_messages)
+        for index, (stored_message, request_message) in enumerate(zip(stored_messages, preserved, strict=False)):
+            sidecars = {key: stored_message[key] for key in self.SERVER_MESSAGE_KEYS if key in stored_message}
+            if (
+                sidecars
+                and stored_message.get("role") == "assistant"
+                and strict_message_matches(stored_message, request_message)
+            ):
+                preserved[index] = {**request_message, **sidecars}
+        return preserved
 
     def _encode_text(self, text: str) -> list[int]:
         return self.tokenizer.encode(text, add_special_tokens=False)
@@ -485,11 +550,19 @@ class GLM47TITOTokenizer(TITOTokenizer):
 
     ``<|user|>`` and ``<|observation|>`` are both assistant stop tokens *and*
     next-message start tokens in the chat template.  In ``merge_tokens``,
-    the last token of the pretokenized prefix is always stripped when it is
-    one of these boundary tokens — whether it matches the first incremental
-    token (overlap) or differs (e.g. model stopped with ``<|observation|>`` but
-    next turn is ``<|user|>`` because the tool call failed and a system message
-    is injected instead).
+    the last token of the pretokenized prefix is stripped when it is one of
+    these boundary tokens.  When the first incremental token is the same token
+    (a tool message after ``<|observation|>``, a user message after
+    ``<|user|>``), the strip only drops the duplicate.  When it differs (e.g.
+    the model stopped with ``<|observation|>`` but the next message is a user
+    message because the tool call failed to parse or went unanswered), the
+    strip replaces the sampled stop token: allowed by default for this family
+    with one warning per replacement, rejected under
+    ``--no-allow-stop-token-replace``.
+
+    Because of that replacement the runtime accepts every role after an
+    assistant with or without ``tool_calls``, so the continuation roles keep
+    their maximal default even though the model expects ``tool`` after a call.
     """
 
     reasoning_parser = "glm45"
@@ -503,6 +576,7 @@ class GLM47TITOTokenizer(TITOTokenizer):
     )
 
     max_trim_tokens: int = 1
+    allow_stop_token_replace: bool = True
     _default_assistant_start_str: str = "<|assistant|>"
 
     def __init__(
@@ -532,6 +606,15 @@ class GLM47TITOTokenizer(TITOTokenizer):
         incremental = self.tokenize_additional_messages(old_messages, new_messages, template_args=template_args)
         prefix = list(pretokenized_token_ids)
         if prefix and prefix[-1] in self._ambiguous_boundary_ids:
+            if prefix[-1] != incremental[0]:
+                sampled, replacement = self.tokenizer.convert_ids_to_tokens([prefix[-1], incremental[0]])
+                detail = (
+                    f"sampled stop token {sampled} is replaced by {replacement}, "
+                    "the first token of the appended render"
+                )
+                if not self.allow_stop_token_replace:
+                    raise MessageValidationError(f"{detail}; rejected by --no-allow-stop-token-replace")
+                logger.warning("%s; that turn's training sample drops the sampled token", detail)
             prefix = prefix[:-1]
         return prefix + incremental
 
@@ -702,7 +785,8 @@ class MinimaxM25TITOTokenizer(TITOTokenizer):
     requires the fixed jinja with ``clear_thinking=False`` to always
     preserve history reasoning.  The fixed Jinja renders tool, user, and
     assistant appends, but ignores mid-session system messages, so that role
-    is excluded from its capability.
+    is excluded from its capability.  It raises on a ``tool`` message that
+    follows an assistant without ``tool_calls``.
     """
 
     reasoning_parser = "minimax-append-think"
@@ -712,6 +796,7 @@ class MinimaxM25TITOTokenizer(TITOTokenizer):
         template="minimax_m25_fixed.jinja",
         extra_kwargs={"clear_thinking": False},
         allowed_append_roles=frozenset({"tool", "user", "assistant"}),
+        roles_after_no_tool_call=frozenset({"user", "assistant"}),
     )
 
     _default_assistant_start_str: str = "]~b]ai"
@@ -762,6 +847,7 @@ class MinimaxM27TITOTokenizer(MinimaxM25TITOTokenizer):
         template="minimax_m27_fixed.jinja",
         extra_kwargs={"clear_thinking": False},
         allowed_append_roles=frozenset({"tool", "user", "assistant"}),
+        roles_after_no_tool_call=frozenset({"user", "assistant"}),
     )
 
 
@@ -785,8 +871,9 @@ class DeepSeekV32TITOTokenizer(TITOTokenizer):
     ``last_user_idx``: appending a *user* turn re-classifies every prior
     assistant as "before last user" and strips its thinking block, which is
     not append-only.  The vendored copy honors ``drop_thinking=False`` at the
-    render level (like ``encoding_dsv4``), so every surface pins it and the
-    ``{tool, user}`` surface becomes legal.
+    render level, so every surface pins it and the
+    ``{tool, user}`` surface becomes legal.  The encoder refuses a ``tool``
+    message after an assistant without ``tool_calls``.
     """
 
     reasoning_parser = "deepseek-v3"
@@ -796,6 +883,7 @@ class DeepSeekV32TITOTokenizer(TITOTokenizer):
         template=None,
         extra_kwargs={"drop_thinking": False},
         consistant_kwargs=["add_default_bos_token", "context"],
+        roles_after_no_tool_call=frozenset({"user", "system", "assistant"}),
     )
 
     _DEFAULT_ASSISTANT_START = "<｜Assistant｜>"
@@ -867,12 +955,16 @@ class DeepSeekV32TITOTokenizer(TITOTokenizer):
 
 
 class DeepSeekV4TITOTokenizer(TITOTokenizer):
-    """DeepSeek V4 — official encoder via sglang's ``encoding_dsv4``.
+    """DeepSeek V4 — deepseek-recipe via sglang's ``DeepSeekRecipe``.
 
     Like V3.2, V4 ships no jinja chat_template; miles' ``apply_chat_template``
     routes any V4 tokenizer to the ``chat_template_utils.deepseek`` bridge, and
     TITO incremental tokenization rides that same bridge to stay byte-aligned
-    with what the runtime serves.
+    with what the session server sends as TITO input ids.
+
+    deepseek-recipe converts only a history whose tool calls are all answered,
+    so ``tool`` messages are the only continuation of an assistant with
+    ``tool_calls``, and a ``tool`` message needs a preceding call.
     """
 
     reasoning_parser = "deepseek-v4"
@@ -880,10 +972,12 @@ class DeepSeekV4TITOTokenizer(TITOTokenizer):
 
     FIXED_TEMPLATE = FixedTemplate(
         template=None,
-        extra_kwargs={"drop_thinking": False},
         allowed_append_roles=frozenset({"tool", "user", "assistant"}),
-        consistant_kwargs=["add_default_bos_token", "context", "reasoning_effort"],
+        consistant_kwargs=["reasoning_effort"],
+        roles_after_tool_call=frozenset({"tool"}),
+        roles_after_no_tool_call=frozenset({"user", "assistant"}),
     )
+    SERVER_MESSAGE_KEYS = (deepseek.CONTENT_LEADING_WHITESPACE_KEY,)
 
     _DEFAULT_ASSISTANT_START = "<｜Assistant｜>"
 
@@ -957,16 +1051,114 @@ class DeepSeekV4TITOTokenizer(TITOTokenizer):
         *,
         template_args: dict[str, Any] | None = None,
     ) -> list[int]:
-        """Diff real-history renders because V4 folds adjacent ``tool``/``user`` turns."""
+        """Diff real-history renders because V4 folds adjacent ``tool``/``user`` turns.
+
+        Both renders start at the history's last assistant turn.  recipe folds, sorts
+        and encodes nothing across an assistant turn, so they end as renders of the
+        whole history do, at a cost that follows the appended messages.
+
+        The diff is over recipe's ids where it can be: recipe encodes message text
+        without the added vocabulary, so re-encoding text could turn content into
+        special tokens.
+        """
         assert_messages_append_only_with_allowed_role(old_messages, new_messages, self.allowed_append_roles)
-        text_old = self.apply_chat_template(old_messages, add_generation_prompt=False, template_args=template_args)
-        text_new = self.apply_chat_template(new_messages, add_generation_prompt=True, template_args=template_args)
-        if not text_new.startswith(text_old):
+        context = _from_last_assistant(old_messages)
+        ids_old = self.apply_chat_template(
+            context, add_generation_prompt=False, tokenize=True, template_args=template_args
+        )
+        ids_new = self.apply_chat_template(
+            context + new_messages[len(old_messages) :],
+            add_generation_prompt=True,
+            tokenize=True,
+            template_args=template_args,
+        )
+        if ids_new[: len(ids_old)] == ids_old:
+            return ids_new[len(ids_old) :]
+        # A plain-text junction, such as a user turn folded after a tool result, can merge
+        # the prefix's last token with the appended text.  recipe encodes the text between
+        # special tokens on its own, so only the appended text up to the next one changes.
+        added = set(self.tokenizer.added_tokens_decoder)
+        diverged = next(
+            (i for i, (old, new) in enumerate(zip(ids_old, ids_new, strict=False)) if old != new),
+            min(len(ids_old), len(ids_new)),
+        )
+        special = next((i for i in range(diverged, len(ids_new)) if ids_new[i] in added), len(ids_new))
+        text_old = self.tokenizer.decode(ids_old, skip_special_tokens=False)
+        junction = self.tokenizer.decode(ids_new[:special], skip_special_tokens=False)
+        if not junction.startswith(text_old):
             raise ValueError(
                 "deepseek_v4 render is not append-only for the appended messages "
-                "(prefix render changed; check drop_thinking and tool-result ordering)"
+                "(prefix render changed; check tool-result ordering)"
             )
-        return self._encode_text(text_new[len(text_old) :])
+        return deepseek.encode_plain_text(self.tokenizer, junction[len(text_old) :]) + ids_new[special:]
+
+    def postprocess_completion(
+        self,
+        *,
+        choice: dict[str, Any],
+        assistant_message: dict[str, Any],
+        completion_token_ids: list[int],
+    ) -> dict[str, Any]:
+        """Store the whitespace recipe's parser stripped before the content; the client's message stays as is."""
+        text = self.tokenizer.decode(completion_token_ids, skip_special_tokens=False)
+        whitespace = deepseek.stripped_content_whitespace(text, assistant_message.get("content") or "")
+        if not whitespace:
+            return assistant_message
+        return {**assistant_message, deepseek.CONTENT_LEADING_WHITESPACE_KEY: whitespace}
+
+
+class DeepSeekV41TITOTokenizer(DeepSeekV4TITOTokenizer):
+    """DeepSeek V4.1 — deepseek-recipe's V4.1 encoding; the V4 incremental-render
+    machinery applies unchanged.
+
+    V4.1 renders a ``system`` message where it stands, behind ``<｜System｜>``, so
+    one appended after an answer or a tool result keeps the prefix.  V4 hoists
+    every system message into the preamble.
+    """
+
+    reasoning_parser = "deepseek-v41"
+    tool_call_parser = "deepseekv41"
+
+    FIXED_TEMPLATE = FixedTemplate(
+        template=None,
+        consistant_kwargs=["reasoning_effort"],
+        roles_after_tool_call=frozenset({"tool"}),
+        roles_after_no_tool_call=frozenset({"user", "system", "assistant"}),
+    )
+
+    def __init__(
+        self,
+        tokenizer: Any,
+        chat_template_kwargs: dict[str, Any] | None = None,
+        assistant_start_str: str | None = None,
+    ):
+        super().__init__(tokenizer, chat_template_kwargs=chat_template_kwargs, assistant_start_str=assistant_start_str)
+        self.chat_template_kwargs = {
+            **self.chat_template_kwargs,
+            "thinking": deepseek.V41.render_thinking_enabled(self.chat_template_kwargs),
+        }
+
+
+class MuseSparkTITOTokenizer(TITOTokenizer):
+    FIXED_TEMPLATE = FixedTemplate(template="muse_spark_fixed.jinja")
+    reasoning_parser = "muse"
+    tool_call_parser = "muse"
+
+    def __init__(
+        self,
+        tokenizer: Any,
+        chat_template_kwargs: dict[str, Any] | None = None,
+        assistant_start_str: str | None = None,
+    ):
+        # Keep the recipient header and body in one comparator segment; the
+        # message separator is internal to a turn, not a role boundary.
+        super().__init__(
+            tokenizer,
+            chat_template_kwargs=chat_template_kwargs,
+            assistant_start_str=assistant_start_str or "<|start|>assistant",
+            special_token_ids=TokenSeqComparator.collect_special_ids(tokenizer)
+            - {tokenizer.convert_tokens_to_ids("<|message|>")},
+        )
 
 
 class InklingTITOTokenizer(TITOTokenizer):
@@ -981,6 +1173,7 @@ class InklingTITOTokenizer(TITOTokenizer):
     """
 
     FIXED_TEMPLATE = FixedTemplate(template="inkling_fixed.jinja", consistant_kwargs=["reasoning_effort"])
+    SERVER_MESSAGE_KEYS = ("content_blocks",)
 
     _DEFAULT_ASSISTANT_START = "<|message_model|>"
 
@@ -1025,24 +1218,6 @@ class InklingTITOTokenizer(TITOTokenizer):
             choice["finish_reason"] = "tool_calls"
         return parsed.stored_message
 
-    def preserve_server_message_state(
-        self,
-        stored_messages: list[dict[str, Any]],
-        request_messages: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        preserved = list(request_messages)
-        for index, request_message in enumerate(preserved):
-            if index >= len(stored_messages):
-                break
-            stored_message = stored_messages[index]
-            if stored_message.get("role") != "assistant" or not strict_message_matches(
-                stored_message, request_message
-            ):
-                continue
-            if "content_blocks" in stored_message:
-                preserved[index] = {**request_message, "content_blocks": stored_message["content_blocks"]}
-        return preserved
-
 
 # ---------------------------------------------------------------------------
 # Enum + Factory
@@ -1066,7 +1241,9 @@ class TITOTokenizerType(StrEnum):
     MINIMAX_M27 = "minimax_m27"
     DEEPSEEKV32 = "deepseekv32"
     DEEPSEEKV4 = "deepseekv4"
+    DEEPSEEKV41 = "deepseekv41"
     INKLING = "inkling"
+    MUSE_SPARK = "muse_spark"
 
     @classmethod
     def get_tokenizer_class(cls, t: TITOTokenizerType) -> type[TITOTokenizer]:
@@ -1102,8 +1279,12 @@ class TITOTokenizerType(StrEnum):
                 return DeepSeekV32TITOTokenizer
             case cls.DEEPSEEKV4:
                 return DeepSeekV4TITOTokenizer
+            case cls.DEEPSEEKV41:
+                return DeepSeekV41TITOTokenizer
             case cls.INKLING:
                 return InklingTITOTokenizer
+            case cls.MUSE_SPARK:
+                return MuseSparkTITOTokenizer
             case _:
                 raise ValueError(f"Unknown TITOTokenizerType: {t!r}")
 
@@ -1113,6 +1294,7 @@ def get_tito_tokenizer(
     tokenizer_type: TITOTokenizerType | str = TITOTokenizerType.DEFAULT,
     chat_template_kwargs: dict[str, Any] | None = None,
     assistant_start_str: str | None = None,
+    allow_stop_token_replace: bool | None = None,
 ) -> TITOTokenizer:
     """Create a ``TITOTokenizer`` instance.
 
@@ -1124,6 +1306,8 @@ def get_tito_tokenizer(
         assistant_start_str: Decoded text prefix identifying assistant content
             segments (e.g. ``"<|im_start|>assistant"``).  Auto-detected from
             the chat template by default; pass explicitly to override.
+        allow_stop_token_replace: The run's resolved ``--allow-stop-token-replace``;
+            ``None`` keeps the family default.
     """
     if tokenizer is None:
         raise ValueError("tokenizer must not be None")
@@ -1133,7 +1317,10 @@ def get_tito_tokenizer(
     kwargs: dict[str, Any] = {"chat_template_kwargs": chat_template_kwargs}
     if assistant_start_str is not None:
         kwargs["assistant_start_str"] = assistant_start_str
-    return cls(tokenizer, **kwargs)
+    tito = cls(tokenizer, **kwargs)
+    if allow_stop_token_replace is not None:
+        tito.allow_stop_token_replace = allow_stop_token_replace
+    return tito
 
 
 # ---------------------------------------------------------------------------

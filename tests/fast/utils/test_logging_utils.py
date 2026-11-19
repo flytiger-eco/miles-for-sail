@@ -32,7 +32,7 @@ def _worker_class_paths() -> list[str]:
             if name.endswith("_WORKER_CLASS"):
                 paths.add(value)
             elif name.endswith("_CLASSES") and isinstance(value, dict):
-                paths.update(value.values())
+                paths.update(path for path in value.values() if isinstance(path, str))
 
     assert paths, f"no worker classes found in {SPECS_PACKAGE}"
     return sorted(paths)
@@ -64,7 +64,7 @@ class TestConfigureLogger:
 
     def _configure(self, **overrides) -> None:
         configure_logger(
-            argparse.Namespace(save_debug_event_data=None),
+            argparse.Namespace(save_debug_event_data=None, ci_test=False, ci_disable_config_snapshot=False),
             source=SimpleProcessIdentity(component="main"),
             **overrides,
         )
@@ -142,6 +142,8 @@ class TestServedWorkerLogging:
     def test_worker_configures_its_logger(self, worker_class_path: str) -> None:
         """Every served worker owns a process, and configure_logger is where that process names
         itself, opens its event log and reports its environment."""
+        if ".torchtitan_utils." in worker_class_path:
+            pytest.importorskip("torchtitan", reason="torchtitan ships with the gpu image, not the cpu lane")
         assert _configures_logger(
             _load_class(worker_class_path)
         ), f"{worker_class_path} runs as its own process but never calls configure_logger"

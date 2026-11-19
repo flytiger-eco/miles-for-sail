@@ -55,12 +55,17 @@ def _nemotron_checkpoint(sandbox: Path) -> dict[str, object]:
 
 
 _SCRIPTS_WHOSE_DEFAULTS_ARE_UNSUPPORTED: dict[str, Callable[[Path], dict[str, object]]] = {
+    "scripts/amd/run_glm5_2_744b_a40b.py": lambda sandbox: _glm_checkpoint(sandbox, "GLM-5.2_5layer", 5),
     "scripts/run_deepseek_v4.py": lambda sandbox: {"model_name": "DeepSeek-V4-Flash-FP8-4layer"},
     "scripts/run_glm5_744b_a40b.py": lambda sandbox: _glm_checkpoint(sandbox, "GLM-5", 78),
     "scripts/run_glm5_2_744b_a40b.py": lambda sandbox: _glm_checkpoint(sandbox, "GLM-5.2", 78),
     "scripts/run_inkling.py": lambda sandbox: {"model_name": "Inkling-4layer"},
     # convert_checkpoint locks a file under model_dir, which must be writable while recording
-    "scripts/run_kimi_k3.py": lambda sandbox: {"model_dir": str(sandbox / "models")},
+    "scripts/run_kimi_k3.py": lambda sandbox: {"model_dir": str(sandbox / "models"), "skip_saving": True},
+    # test_prepare_waits_for_shared_checkpoint_conversion covers the real cache lock.
+    "scripts/run_mimo_v2_6_flash.py": lambda sandbox: {"model_dir": str(sandbox / "models")},
+    # Its prepare takes the same lock through run_mimo_v2_6_flash._prepare_checkpoint.
+    "scripts/run_mimo_v2_6_flash_tinker.py": lambda sandbox: {"model_dir": str(sandbox / "models")},
     "scripts/run_nemotron_3_nano_4b_fsdp.py": _nemotron_checkpoint,
     "scripts/run_nemotron_3_ultra_550b_a55b.py": lambda sandbox: {
         "model_name": "NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16-4layer"
@@ -70,6 +75,7 @@ _SCRIPTS_WHOSE_DEFAULTS_ARE_UNSUPPORTED: dict[str, Callable[[Path], dict[str, ob
 # The machine each recording represents. Launchers default --hardware to whatever node they run on, so the
 # suite pins one; FROZEN_HARDWARE covers the rest.
 _HARDWARE_A_RECORDING_REPRESENTS = {
+    "scripts/amd/run_gpt_oss_20b_lora.py": "MI355X",
     "scripts/amd/run_qwen3_30b_a3b.py": "MI355X",
     "scripts/amd/run_qwen3_4b.py": "MI355X",
     "scripts/amd/run_qwen3_4b_lora.py": "MI355X",
@@ -82,7 +88,6 @@ _HARDWARE_A_RECORDING_REPRESENTS = {
 }
 
 _ENTRYPOINTS_DISABLED_BY_THEIR_OWN_DEFAULTS = {
-    ("scripts/run_deepseek_v4.py", "prepare_mxfp8"),
     ("scripts/run_deepseek_v4.py", "prepare_fp8"),
 }
 

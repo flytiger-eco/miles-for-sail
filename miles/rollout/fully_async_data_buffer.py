@@ -1,6 +1,6 @@
 """Data buffer between fully-async rollout production and training consumption.
 
-``DataBuffer`` is the contract (put / get / get_metrics); ``DefaultDataBuffer``
+``DataBuffer`` is the contract (put / get / metrics / checkpoint state); ``DefaultDataBuffer``
 is the built-in implementation, replaceable via ``--custom-async-data-buffer-path``.
 Every group-level decision lives here — what to keep, what to hand to
 ``--async-unused-samples-handler`` — so a custom buffer owns all of it. Only
@@ -9,12 +9,15 @@ Every group-level decision lives here — what to keep, what to hand to
 
 import asyncio
 import logging
+import random
+import time
 from abc import ABC, abstractmethod
 from argparse import ArgumentParser, Namespace
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from enum import Enum
+from typing import Any
 
-from miles.backends.megatron_utils.megatron_config import resolve_megatron_config
 from miles.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_filter, iter_samples
 from miles.rollout.filter_hub.common_filters import (
     GroupWeightVersionStats,
@@ -23,7 +26,9 @@ from miles.rollout.filter_hub.common_filters import (
     group_staleness,
     group_weight_version_stats,
 )
+from miles.utils.audit_utils.sample_ownership.recorder import SampleOwnershipRecorder
 from miles.utils.function_registry import load_function
+from miles.utils.output_store.dropped import record_dropped_samples, regenerated_on_restore
 from miles.utils.types import Sample
 
 logger = logging.getLogger(__name__)
@@ -33,6 +38,15 @@ logger = logging.getLogger(__name__)
 Group = list[Sample | list[Sample]]
 
 DATA_BUFFER_PATH_PER_MODEL_FLAG = "--custom-async-data-buffer-path-per-model"
+
+NO_PROGRESS_WARN_SECS = 30.0
+
+
+class UnusedReason(str, Enum):
+    ABORTED = "aborted"
+    STALE = "stale"
+    # Restored from a checkpoint with output store refs, whose objects did not survive the restart.
+    RESTORED = "restored"
 
 
 def add_data_buffer_arguments(parser: ArgumentParser) -> None:
@@ -65,7 +79,9 @@ def first_sample(group: Group) -> Sample:
 
 class DataBufferConstructorInput:
     args: Namespace
-    unused_handler_fn: Callable[[list[Sample]], None]  # --async-unused-samples-handler, applied to unused groups
+    unused_handler_fn: Callable[
+        [list[Sample], UnusedReason], None
+    ]  # --async-unused-samples-handler, applied to unused groups
 
 
 @dataclass
@@ -74,11 +90,14 @@ class DataBufferInput:
     group: Group  # finished samples
 
 
+MULTI_POLICY_CHECKPOINT_UNSUPPORTED = "multi-policy rollout state is not checkpointed"
+
+
 class DataBuffer(ABC):
     """Store for finished groups between rollout production and training consumption.
 
-    The producer puts each finished group as it completes; the consumer gets one
-    group at a time; get_metrics is collected once per training step. Storage,
+    The producer puts each finished group as it completes; the consumer gets a whole
+    training batch at once; get_metrics is collected once per training step. Storage,
     ordering, and filtering are invisible to callers — an implementation is free
     to reject a group on put, on get, or not at all.
     """
@@ -88,8 +107,8 @@ class DataBuffer(ABC):
         """Accept a finished group; may store it, reject it, or evict to make room."""
 
     @abstractmethod
-    async def get(self, **context) -> DataBufferInput:
-        """Return one group to train on, waiting until one is available.
+    async def get(self, *, num_groups: int, **context) -> list[DataBufferInput]:
+        """Return exactly ``num_groups`` groups at once, waiting until that many are available.
 
         ``context`` is the extra information for sample processing at get() time,
         including the ``trainer_model_id`` whose groups are asked for.
@@ -99,12 +118,29 @@ class DataBuffer(ABC):
     def get_metrics(self, trainer_model_id: str | None = None) -> dict[str, float]:
         """Report the metrics of one policy since its previous call (its window counters reset here)."""
 
+    def state_dict(self) -> Any:
+        raise NotImplementedError(f"{type(self).__name__} must implement state_dict() for checkpointing")
+
+    def load_state_dict(self, state: Any) -> None:
+        raise NotImplementedError(f"{type(self).__name__} must implement load_state_dict() for checkpointing")
+
+    def admits(self, *, in_flight: int) -> bool:
+        """Whether the producer may submit one more group while ``in_flight`` groups are generating.
+
+        Asked again whenever a group finishes, a get() starts, or a group goes to the unused handler.
+        """
+        return True
+
+    def drop_saved_state(self, state: Any, *, reason: str) -> None:
+        """Instead of ``load_state_dict``: record the saved groups as dropped, e.g. after a data source reset."""
+        raise NotImplementedError(f"{type(self).__name__} must implement drop_saved_state() for a data reset")
+
 
 # ============================= one policy buffer ==============================
 
 
 class DefaultDataBuffer(DataBuffer):
-    """FIFO buffer of finished groups, filtering out what training should not see.
+    """Buffer of finished groups, filtering out what training should not see.
 
     Rejected on put, because the verdict is fixed once the group is generated:
 
@@ -121,7 +157,9 @@ class DefaultDataBuffer(DataBuffer):
     (1) capacity: ``--async-data-buffer-capacity-factor`` bounds the buffer at
         floor(factor * rollout_batch_size) groups; when full, put blocks until
         training consumes.
-    (2) unused handling: ``--async-unused-samples-handler`` decides what happens
+    (2) selection: ``--async-data-buffer-selection`` hands a get the earliest
+        finished groups (fifo) or a random subset of the buffered ones.
+    (3) unused handling: ``--async-unused-samples-handler`` decides what happens
         to aborted and stale groups: drop discards them, retry recycles their
         prompts for regeneration. Missing-reward and custom-filter rejections
         are discarded directly.
@@ -134,12 +172,17 @@ class DefaultDataBuffer(DataBuffer):
         self._buffer: list[DataBufferInput] = []
         assert args.async_data_buffer_capacity_factor > 0
         self._capacity = int(args.async_data_buffer_capacity_factor * args.rollout_batch_size)
-        assert self._capacity >= 1
+        assert self._capacity >= args.rollout_batch_size, (
+            f"buffer capacity {self._capacity} is below the rollout batch of {args.rollout_batch_size} groups that "
+            f"one get asks for, so --async-data-buffer-capacity-factor must be at least 1.0"
+        )
 
         self._unused_handler_fn = input.unused_handler_fn
         self._dynamic_filter = load_function(args.dynamic_sampling_filter_path)
         self._cond = asyncio.Condition()
+        self._rng = random.Random(args.rollout_seed)
         self._current_version: int | None = None
+        self._get_pending = False
 
         self._metric_gatherer = MetricGatherer()
         self._metric_aborted_groups = 0
@@ -166,42 +209,88 @@ class DefaultDataBuffer(DataBuffer):
         output = apply_aborted_filter(self._args, input.group)
         if not output.keep:
             self._metric_aborted_groups += 1
-            self._unused_handler_fn(input.prompt_group)
+            # Before the handler: a retry resets the prompt group, plans included.
+            record_dropped_samples([input.prompt_group, input.group])
+            self._unused_handler_fn(input.prompt_group, UnusedReason.ABORTED)
             return False
 
         output = apply_missing_reward_filter(self._args, input.group)
         if not output.keep:
             self._metric_gatherer.on_dynamic_filter_drop(reason=output.reason)
+            record_dropped_samples([input.prompt_group, input.group])
+            SampleOwnershipRecorder.log_dropped_samples(
+                args=self._args, samples=input.prompt_group, reason="missing_reward"
+            )
             return False
 
         self._metric_gatherer.on_group_before_dynamic_filter(self._args, input.group)
         output = call_dynamic_filter(self._dynamic_filter, self._args, input.group)
         if not output.keep:
             self._metric_gatherer.on_dynamic_filter_drop(reason=output.reason)
+            record_dropped_samples([input.prompt_group, input.group])
+            SampleOwnershipRecorder.log_dropped_samples(
+                args=self._args, samples=input.prompt_group, reason="dynamic_filter"
+            )
             return False
         return True
 
-    async def get(self, current_version: int | None = None, **_) -> DataBufferInput:
+    async def get(self, *, num_groups: int, current_version: int | None = None, **_) -> list[DataBufferInput]:
+        self._get_pending = True
+        try:
+            return await self._take(num_groups=num_groups, current_version=current_version)
+        finally:
+            self._get_pending = False
+
+    async def _take(self, *, num_groups: int, current_version: int | None) -> list[DataBufferInput]:
         if current_version is not None:
             self._current_version = current_version
         async with self._cond:
+            deadline = time.monotonic() + NO_PROGRESS_WARN_SECS
             while True:
-                while not self._buffer:
-                    await self._cond.wait()
-                entry = self._buffer.pop(0)
-                self._cond.notify_all()  # wake producers blocked on a full buffer
+                # filters at retrieving sample: staleness filter
+                self._drop_stale(current_version)
+                if len(self._buffer) >= num_groups:
+                    break
+                if (remaining := deadline - time.monotonic()) <= 0:
+                    logger.warning(f"No completed rollout groups for {NO_PROGRESS_WARN_SECS}s")
+                    deadline = time.monotonic() + NO_PROGRESS_WARN_SECS
+                    remaining = NO_PROGRESS_WARN_SECS
+                try:
+                    await asyncio.wait_for(self._cond.wait(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    pass
 
+            if self._args.async_data_buffer_selection == "random":
+                taken = set(self._rng.sample(range(len(self._buffer)), num_groups))
+                entries = [entry for i, entry in enumerate(self._buffer) if i in taken]
+                self._buffer = [entry for i, entry in enumerate(self._buffer) if i not in taken]
+            else:
+                entries = self._buffer[:num_groups]
+                del self._buffer[:num_groups]
+            self._cond.notify_all()  # wake producers blocked on a full buffer
+            for entry in entries:
                 version_stats = group_weight_version_stats(entry.group)
-                staleness = version_stats.oldest_lag(current_version)
-                if staleness is not None:
-                    if self._args.max_weight_staleness is not None and staleness > self._args.max_weight_staleness:
-                        logger.info(f"Filtered stale group ({staleness=} > max={self._args.max_weight_staleness})")
-                        self._metric_stale_groups += 1
-                        self._unused_handler_fn(entry.prompt_group)
-                        continue
+                if (staleness := version_stats.oldest_lag(current_version)) is not None:
                     self._metric_consumed_staleness.append(staleness)
                 self._record_selected_version_stats(version_stats, current_version)
-                return entry
+            return entries
+
+    def _drop_stale(self, current_version: int | None) -> None:
+        limit = self._args.max_weight_staleness
+        kept: list[DataBufferInput] = []
+        for entry in self._buffer:
+            staleness = group_staleness(entry.group, current_version)
+            if limit is None or staleness is None or staleness <= limit:
+                kept.append(entry)
+            else:
+                logger.info(f"Filtered stale group ({staleness=} > max={limit})")
+                self._metric_stale_groups += 1
+                record_dropped_samples([entry.prompt_group, entry.group])
+                self._unused_handler_fn(entry.prompt_group, UnusedReason.STALE)
+
+        if len(kept) != len(self._buffer):
+            self._buffer = kept
+            self._cond.notify_all()
 
     def _record_selected_version_stats(
         self,
@@ -222,6 +311,32 @@ class DefaultDataBuffer(DataBuffer):
         if token_weighted_lag is not None:
             self._metric_selected_token_lag_sum += token_weighted_lag * stats.versioned_token_count
             self._metric_selected_versioned_tokens += stats.versioned_token_count
+
+    def state_dict(self) -> list[DataBufferInput]:
+        return list(self._buffer)
+
+    def load_state_dict(self, state: list[DataBufferInput]) -> None:
+        assert not self._buffer
+        for entry in state:
+            if regenerated_on_restore(entry.group, use_output_store=self._args.use_output_store):
+                record_dropped_samples([entry.prompt_group, entry.group])
+                self._unused_handler_fn(entry.prompt_group, UnusedReason.RESTORED)
+            else:
+                self._buffer.append(entry)
+
+    def admits(self, *, in_flight: int) -> bool:
+        if not self._args.async_submit_within_staleness:
+            return True
+        # With fifo selection get() hands out groups in completion order, one weight version per call, so a group
+        # that enters the buffer is trained at most max_weight_staleness versions later; random selection can keep
+        # a group longer, until the staleness filter drops it.
+        window = self._args.max_weight_staleness + int(self._get_pending)
+        return len(self._buffer) + in_flight < window * self._args.rollout_batch_size
+
+    def drop_saved_state(self, state: list[DataBufferInput], *, reason: str) -> None:
+        record_dropped_samples([[entry.prompt_group, entry.group] for entry in state])
+        samples = [sample for entry in state for sample in entry.prompt_group]
+        SampleOwnershipRecorder.log_dropped_samples(args=self._args, samples=samples, reason=reason)
 
     def get_metrics(self, trainer_model_id: str | None = None) -> dict[str, float]:
         prefix = "rollout/fully_async/"
@@ -279,7 +394,7 @@ class DefaultMultiDataBuffer(DataBuffer):
 
     def __init__(self, input: DataBufferConstructorInput):
         paths = _parse_data_buffer_paths(input.args.custom_async_data_buffer_path_per_model)
-        model_ids = resolve_megatron_config(input.args).model_ids
+        model_ids = input.args.raw_megatron.model_ids
         assert not (unknown := sorted(set(paths) - set(model_ids))), (
             f"{DATA_BUFFER_PATH_PER_MODEL_FLAG} names {unknown}, which train no policy of this run "
             f"({sorted(model_ids)})"
@@ -293,11 +408,21 @@ class DefaultMultiDataBuffer(DataBuffer):
         for trainer_model_id, entry in _split_by_trainer_model_id(input).items():
             await self._inner_of(trainer_model_id).put(entry)
 
-    async def get(self, trainer_model_id: str | None = None, **context) -> DataBufferInput:
+    async def get(self, *, trainer_model_id: str | None = None, **context) -> list[DataBufferInput]:
         return await self._inner_of(trainer_model_id).get(trainer_model_id=trainer_model_id, **context)
 
     def get_metrics(self, trainer_model_id: str | None = None) -> dict[str, float]:
         return self._inner_of(trainer_model_id).get_metrics(trainer_model_id=trainer_model_id)
+
+    def state_dict(self) -> Any:
+        logger.warning(MULTI_POLICY_CHECKPOINT_UNSUPPORTED)
+        return []
+
+    def load_state_dict(self, state: Any) -> None:
+        logger.warning(MULTI_POLICY_CHECKPOINT_UNSUPPORTED)
+
+    def drop_saved_state(self, state: Any, *, reason: str) -> None:
+        logger.warning(MULTI_POLICY_CHECKPOINT_UNSUPPORTED)
 
     def _inner_of(self, trainer_model_id: str | None) -> DataBuffer:
         assert trainer_model_id in self._inners, (

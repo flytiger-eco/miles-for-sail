@@ -15,13 +15,56 @@ class DeepseekV32Bridge(DeepseekV3Bridge):
         "self_attention.weights_proj.weight": ["model.layers.{layer_number}.self_attn.indexer.weights_proj.weight"],
         "self_attention.k_norm.weight": ["model.layers.{layer_number}.self_attn.indexer.k_norm.weight"],
         "self_attention.k_norm.bias": ["model.layers.{layer_number}.self_attn.indexer.k_norm.bias"],
+        # Mbridge maps each actual model parameter to HF, so both naming
+        # layouts can coexist here without duplicating checkpoint imports.
+        "self_attention.core_attention.indexer.linear_wq_b.weight": [
+            "model.layers.{layer_number}.self_attn.indexer.wq_b.weight"
+        ],
+        "self_attention.core_attention.indexer.linear_wk.weight": [
+            "model.layers.{layer_number}.self_attn.indexer.wk.weight"
+        ],
+        "self_attention.core_attention.indexer.linear_weights_proj.weight": [
+            "model.layers.{layer_number}.self_attn.indexer.weights_proj.weight"
+        ],
+        "self_attention.core_attention.indexer.k_norm.weight": [
+            "model.layers.{layer_number}.self_attn.indexer.k_norm.weight"
+        ],
+        "self_attention.core_attention.indexer.k_norm.bias": [
+            "model.layers.{layer_number}.self_attn.indexer.k_norm.bias"
+        ],
+        "self_attention.q_layernorm.weight": ["model.layers.{layer_number}.self_attn.q_a_layernorm.weight"],
+        "self_attention.kv_layernorm.weight": ["model.layers.{layer_number}.self_attn.kv_a_layernorm.weight"],
     }
     _ATTENTION_MAPPING = {**DeepseekV3Bridge._ATTENTION_MAPPING, **_DSA_ATTENTION_MAPPING}
 
+    def _convert_mtp_param(self, name: str) -> list[str]:
+        assert self.config.mtp_num_layers == 1, "only support one mtp layer for now"
+        mtp_layer_id = self.config.num_layers
+        direct_name_mapping = {
+            "mtp.layers.0.enorm.weight": f"model.layers.{mtp_layer_id}.enorm.weight",
+            "mtp.layers.0.hnorm.weight": f"model.layers.{mtp_layer_id}.hnorm.weight",
+            "mtp.layers.0.eh_proj.weight": f"model.layers.{mtp_layer_id}.eh_proj.weight",
+            "mtp.layers.0.final_layernorm.weight": f"model.layers.{mtp_layer_id}.shared_head.norm.weight",
+        }
+        if name in direct_name_mapping:
+            return [direct_name_mapping[name]]
+        inner = next((p for p in ("transformer_layer", "mtp_model_layer") if f"mtp.layers.0.{p}" in name), None)
+        assert inner is not None, f"mtp not found in {name}"
+        proxy_name = name.replace(f"mtp.layers.0.{inner}", f"decoder.layers.{mtp_layer_id}")
+        if "self_attention" in proxy_name or "input_layernorm.weight" in proxy_name:
+            return self._weight_name_mapping_attention(proxy_name)
+        if "mlp" in proxy_name:
+            return self._weight_name_mapping_mlp(proxy_name)
+        raise NotImplementedError(f"Unsupported parameter name: {name}")
+
     def _get_rope_theta(self):
-        rope_theta = getattr(self.hf_config, "rope_theta", None)
+        rope_theta = getattr(
+            self.hf_config, "rope_theta", None
+        )  # config-access-exempt: HF variants store rotary base directly or in rope_scaling
         if rope_theta is None:
-            rope_scaling = getattr(self.hf_config, "rope_scaling", None)
+            rope_scaling = getattr(
+                self.hf_config, "rope_scaling", None
+            )  # config-access-exempt: HF checkpoints may omit rotary scaling
             if isinstance(rope_scaling, dict):
                 rope_theta = rope_scaling.get("rope_theta")
         if rope_theta is None:
@@ -44,7 +87,9 @@ class DeepseekV32Bridge(DeepseekV3Bridge):
         return rope_scaling
 
     def _get_rope_scaling(self):
-        return self._normalize_rope_scaling(getattr(self.hf_config, "rope_scaling", None))
+        return self._normalize_rope_scaling(
+            getattr(self.hf_config, "rope_scaling", None)
+        )  # config-access-exempt: HF checkpoints may omit rotary scaling
 
     def _hf_config_with_rope_fields(self):
         hf_config = copy.copy(self.hf_config)
@@ -74,10 +119,12 @@ class DeepseekV32Bridge(DeepseekV3Bridge):
     ) -> tuple[list[str], list[torch.Tensor]]:
         """Apply rope reordering when exporting DSA attention weights to HF format.
 
-        Our training uses last half for rope while DeepSeek uses first half,
-        so we swap the two halves.
+        The Miles indexer stores RoPE channels in the last half. Native
+        Megatron's core_attention.indexer already uses HF channel order.
         """
-        if not bool(getattr(self.hf_config, "indexer_rope_interleave", False)):
+        if not bool(
+            getattr(self.hf_config, "indexer_rope_interleave", False)
+        ):  # config-access-exempt: HF checkpoints may omit indexer rotary interleaving
             return super()._weight_to_hf_format(mcore_weights_name, mcore_weights)
 
         if "self_attention.wq_b.weight" in mcore_weights_name:
@@ -108,7 +155,9 @@ class DeepseekV32Bridge(DeepseekV3Bridge):
 
         The swap operation is its own inverse: swap the two halves back.
         """
-        if not bool(getattr(self.hf_config, "indexer_rope_interleave", False)):
+        if not bool(
+            getattr(self.hf_config, "indexer_rope_interleave", False)
+        ):  # config-access-exempt: HF checkpoints may omit indexer rotary interleaving
             return super()._weight_to_mcore_format(mcore_weights_name, hf_weights)
 
         if "self_attention.wq_b.weight" in mcore_weights_name:
