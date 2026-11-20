@@ -87,14 +87,17 @@ jobs:
             exit "$merge_status"
           fi
           [[ "$(git rev-parse MERGE_HEAD)" == "$UPSTREAM_SHA" ]] || exit 1
-          # Protect all local workflows, including upstream additions and deletions.
-          # Only the index is restored; disposable worktree leftovers are not committed.
-          git restore --source="$BASE_SHA" --staged -- .github/workflows
+          # Protect all local workflows, including upstream additions and deletions:
+          # realign every .github/workflows index entry to the target tree. A plain
+          # restore cannot clear modify/delete unmerged entries whose path is absent
+          # from the target tree, which aborts the merge step on those conflicts.
+          # Only the index is aligned; disposable worktree leftovers are not committed.
+          git reset --quiet "$BASE_SHA" -- .github/workflows
           git diff --cached --quiet "$BASE_SHA" -- .github/workflows || exit 1
           git diff --name-only --diff-filter=U -z > "$RUNNER_TEMP/sync-conflicts"
           # The target branch keeps a clean upstream snapshot, so conflicts are
           # not expected. Compute the gate from the refreshed conflict list so
-          # workflow-only conflicts cleared by the restore do not invoke Copilot
+          # workflow-only conflicts cleared by the realignment do not invoke Copilot
           # with an empty evidence set.
           if [[ -s "$RUNNER_TEMP/sync-conflicts" ]]; then
             printf 'has_conflicts=true\n' >> "$GITHUB_OUTPUT"
