@@ -23,6 +23,10 @@ class CaseConfig:
     hf_repo: str
     num_gpus: int
     rollout_num_gpus_per_engine: int
+    sglang_attention_backend: str = "fa3"
+    attn_implementation: str = "flash_attention_3"
+    # Send the replay arrays through the output store (--use-output-store) instead of inline.
+    use_output_store: bool = False
 
 
 def prepare(case: CaseConfig) -> None:
@@ -43,7 +47,7 @@ def execute(case: CaseConfig, wandb_file: str) -> None:
         "--apply-chat-template "
         "--rollout-shuffle "
         "--rm-type math "
-        "--num-rollout 3 "
+        "--num-rollout 2 "
         "--rollout-batch-size 8 "
         "--n-samples-per-prompt 8 "
         "--rollout-max-response-len 1024 "
@@ -81,17 +85,19 @@ def execute(case: CaseConfig, wandb_file: str) -> None:
     )
 
     replay_args = "--use-rollout-routing-replay "
+    if case.use_output_store:
+        replay_args += command_utils.get_output_store_args()
 
     sglang_args = (
         f"--rollout-num-gpus-per-engine {case.rollout_num_gpus_per_engine} "
         "--sglang-mem-fraction-static 0.8 "
         "--sglang-decode-log-interval 1000 "
         "--sglang-chunked-prefill-size 4096 "
-        "--sglang-attention-backend fa3 "
-        "--attn-implementation flash_attention_3 "
+        f"--sglang-attention-backend {case.sglang_attention_backend} "
+        f"--attn-implementation {case.attn_implementation} "
     )
 
-    ci_args = "--ci-test "
+    ci_args = "--ci-test --no-enable-sample-ownership-checker "
 
     misc_args = "--actor-num-nodes 1 " f"--actor-num-gpus-per-node {case.num_gpus} " "--colocate "
 

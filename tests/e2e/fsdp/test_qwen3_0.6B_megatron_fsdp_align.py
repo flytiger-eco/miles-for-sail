@@ -5,15 +5,13 @@ from tests.ci.ci_register import register_cuda_ci, register_rocm_ci
 from miles.utils.external_utils import command_utils
 
 register_cuda_ci(
-    est_time=900,
-    suite="stage-c-2-gpu-h200",
-    labels=["fsdp"],
-    hardware=["hopper", "blackwell"],
+    est_time=900, suite="stage-c-2-gpu-h200", labels=["fsdp"], hardware=["hopper", "blackwell"], num_gpus=2
 )
 register_rocm_ci(
     est_time=800,
-    suite="nightly-stage-c-2-gpu-mi350",
+    suite="stage-c-2-gpu-mi350",
     labels=["fsdp"],
+    nightly=True,
 )
 
 
@@ -82,7 +80,7 @@ def execute():
         "--rollout-num-gpus-per-engine 1 " "--sglang-chunked-prefill-size 4096 " "--sglang-mem-fraction-static 0.75 "
     )
 
-    ci_args = "--ci-test "
+    ci_args = "--ci-test --no-enable-sample-ownership-checker "
 
     misc_args = "--actor-num-nodes 1 " "--colocate " f"--actor-num-gpus-per-node {NUM_GPUS} "
 

@@ -51,6 +51,7 @@ class ScriptArgs(U.ExecuteTrainConfig):
     hf_checkpoint: str | None = None
     bf16_checkpoint: str | None = None
     ref_load: str | None = None
+    rollout_bf16: bool = False
     data_dir: str = "/root/datasets"
     model_dir: str = "/root/models"
     save_dir: str = "/personal/checkpoints"
@@ -299,7 +300,7 @@ def _train(args: ScriptArgs) -> None:
         input_key = "prompt"
 
     ckpt_args = (
-        f"--hf-checkpoint {args.hf_checkpoint} "
+        f"--hf-checkpoint {args.bf16_checkpoint if args.rollout_bf16 else args.hf_checkpoint} "
         f"--ref-load {args.ref_load} "
         "--megatron-to-hf-mode raw "
         "--model-name kimi_k3 "
@@ -444,7 +445,7 @@ def _train(args: ScriptArgs) -> None:
             # the adapter is re-streamed every step; a host copy per TP rank (~45 GB) is never read
             sglang_args += "--sglang-lora-no-cpu-backup "
     # Marlin is the one MXFP4 MoE runner with a LoRA path (Mxfp4MoEMethod has no triton quant info)
-    sglang_args += "--sglang-moe-runner-backend marlin "
+    sglang_args += f"--sglang-moe-runner-backend {'triton' if args.rollout_bf16 else 'marlin'} "
     if args.is_4layer:
         sglang_args += (
             "--sglang-cuda-graph-bs-decode 1 2 4 8 16 "
@@ -481,6 +482,8 @@ def _train(args: ScriptArgs) -> None:
     misc_args += "--check-weight-update-skip-list vision_tower. mm_projector. --check-weight-update-allow-quant-error "
     if args.check_weight_update_equal:
         misc_args += "--check-weight-update-equal "
+    # the adapter checkpoint stores Adam state, and debug_minimal trains with SGD
+    assert args.skip_saving or not (is_debug and is_lora), "debug_minimal LoRA cannot --save; pass --skip-saving"
     if not args.skip_saving:
         misc_args += f"--save {args.save_dir}/{args.run_id} --save-interval 50 "
 

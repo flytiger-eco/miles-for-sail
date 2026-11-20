@@ -274,6 +274,9 @@ def workflow_run(
         "/rerun-test",
         "/rerun-test ",
         "/rerun-test tests/e2e/test_a.py extra",
+        "/rerun-test tests/e2e/test_a.py --hw cuda",
+        "/rerun-test tests/e2e/test_a.py --hw rocm extra",
+        "/rerun-test tests/e2e/test_a.py\n--hw rocm",
         "/rerun-test tests/e2e/test_a.py\n/run-ci-short",
         "please /rerun-test tests/e2e/test_a.py",
         "/rerun-test tests/unit/test_a.py",
@@ -327,6 +330,14 @@ def test_command_parser_accepts_exact_rerun_command_with_outer_whitespace():
 )
 def test_command_parser_accepts_run_file_command(body, test_file):
     assert HANDLER.parse_command(body) == HANDLER.RunTestFile(test_file)
+
+
+@pytest.mark.parametrize("body", [f"{RUN_FILE_BODY} --hw rocm", f" \n{RUN_FILE_BODY} --hw rocm\t"])
+def test_rocm_file_command_uses_the_shared_request_type(body):
+    request = HANDLER.parse_command(body)
+
+    assert type(request) is HANDLER.RunTestFile
+    assert request == HANDLER.RunTestFile(RUN_FILE_PATH, "rocm")
 
 
 @pytest.mark.parametrize("body", ["", "ordinary review comment", "/Clear-labels", "/unknown-command"])
@@ -595,6 +606,8 @@ def test_checked_in_policy_exposes_exact_labels_and_access_groups():
                 258897383,
                 109944218,
                 214322989,
+                13900043,
+                195740905,
             }
         ),
         "author_associations": frozenset(),
@@ -687,6 +700,7 @@ def test_add_label_access_user_id_preflight_does_not_require_repository_permissi
     ("body", "request_type"),
     [
         (RUN_FILE_BODY, HANDLER.RunTestFile),
+        (f"{RUN_FILE_BODY} --hw rocm", HANDLER.RunTestFile),
         ("/rerun-failed-ci", HANDLER.RerunFailedCI),
     ],
 )
@@ -1679,6 +1693,64 @@ def test_repository_writer_dispatches_a_file_run(permission):
     }
 
 
+def test_rocm_file_command_dispatches_the_requested_backend():
+    api = FakeAPI(pull(), permission="write")
+    HANDLER.process_event(event(body=f"{RUN_FILE_BODY} --hw rocm"), policy(), api)
+
+    assert api.dispatch_calls == [
+        (
+            "run-ci-file.yml",
+            "main",
+            {"pull_number": "123", "head_sha": HEAD_SHA, "test_file": RUN_FILE_PATH, "hw": "rocm"},
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("body", "image_tag"),
+    [
+        ("ci-image-tag: pr-42\nci-sglang-pr: #77", None),
+        (
+            "ci-image-tag: pr-42\nci-rocm-image-tag: miles-rocm10-mi35x-20261113\nci-sglang-pr: #77",
+            "miles-rocm10-mi35x-20261113",
+        ),
+    ],
+)
+def test_rocm_file_command_forwards_the_rocm_image_pin_only(body, image_tag):
+    target = pull()
+    target["body"] = body
+    api = FakeAPI(target, permission="write")
+    HANDLER.process_event(event(body=f"{RUN_FILE_BODY} --hw rocm"), policy(), api)
+    inputs = api.dispatch_calls[0][2]
+    assert inputs.get("ci_image_tag") == image_tag
+    assert inputs["ci_sglang_pr"] == "#77"
+
+
+@pytest.mark.parametrize("selector", ["", " --hw rocm"])
+@pytest.mark.parametrize("grant", ["association", "prior_user", "label_user", "none"])
+def test_fork_file_commands_use_the_same_access_group(selector, grant):
+    api = FakeAPI(pull(head_repository_id=HANDLER.REPOSITORY_ID + 1), permission="read")
+    request = event(
+        body=f"{RUN_FILE_BODY}{selector}",
+        author_association="CONTRIBUTOR" if grant == "association" else "FIRST_TIMER",
+    )
+    access = policy(
+        prior_user_ids=(ACTOR_ID,) if grant == "prior_user" else (),
+        user_ids=(ACTOR_ID,) if grant == "label_user" else (),
+    )
+
+    if grant in ("label_user", "none"):
+        with pytest.raises(HANDLER.CommentCommandError, match="not authorized"):
+            HANDLER.process_event(request, access, api)
+        assert api.dispatch_calls == []
+        return
+
+    HANDLER.process_event(request, access, api)
+
+    assert api.permission_calls == []
+    assert api.dispatch_calls[0][2].get("hw", "auto") == ("rocm" if selector else "auto")
+
+
 def test_file_run_main_reports_the_dispatched_run_without_writing_an_output(monkeypatch, tmp_path, capsys):
     api = FakeAPI(pull())
     output_path = tmp_path / "github-output"
@@ -1697,9 +1769,13 @@ def test_file_run_main_reports_the_dispatched_run_without_writing_an_output(monk
     assert not output_path.exists()
 
 
-def test_file_run_forwards_validated_pr_body_pins():
+@pytest.mark.parametrize("bridge_ref", ["#41", "bridge", "v0.7.0", "8cd3466d14d2337c8492827b3712482c2b3e4866"])
+def test_file_run_forwards_validated_pr_body_pins(bridge_ref):
     target = pull()
-    target["body"] = "Summary line\nci-image-tag: pr-42\nci-megatron-pr: #77\nci-sglang-pr: feature/pin-x\n"
+    target["body"] = (
+        "Summary line\nci-image-tag: pr-42\nci-megatron-pr: #77\nci-sglang-pr: feature/pin-x\n"
+        f"ci-megatron-bridge-pr: {bridge_ref}\n"
+    )
     api = FakeAPI(target)
 
     HANDLER.process_event(event(body=RUN_FILE_BODY), policy(), api)
@@ -1712,12 +1788,13 @@ def test_file_run_forwards_validated_pr_body_pins():
         "ci_image_tag": "pr-42",
         "ci_megatron_pr": "#77",
         "ci_sglang_pr": "feature/pin-x",
+        "ci_megatron_bridge_pr": bridge_ref,
     }
 
 
 @pytest.mark.parametrize(
     "line",
-    ["ci-image-tag: -bad", "ci-megatron-pr: $(reboot)", "ci-sglang-pr: bad;ref"],
+    ["ci-image-tag: -bad", "ci-megatron-pr: $(reboot)", "ci-sglang-pr: bad;ref", "ci-megatron-bridge-pr: $(reboot)"],
 )
 def test_file_run_rejects_an_invalid_pr_body_pin(line):
     target = pull()
@@ -2282,6 +2359,36 @@ def test_announce_posts_a_running_status_comment_keyed_to_the_run(monkeypatch):
     }
 
 
+@pytest.mark.parametrize(
+    ("rocm_result", "decision"),
+    [("success", "FILE_RUN_PASSED"), ("failure", "FILE_RUN_FAILED"), ("cancelled", "FILE_RUN_CANCELLED")],
+)
+def test_report_consumes_rocm_result(monkeypatch, rocm_result, decision):
+    api = FakeAPI(pull())
+    monkeypatch.setattr(HANDLER, "_utc_now", lambda: REPORT_NOW)
+    status = file_run_status(
+        FILE_RUN_CUDA_RESULT="skipped",
+        FILE_RUN_ROCM_RESULT=rocm_result,
+        FILE_RUN_SUITE="stage-c-2-gpu-mi350",
+    )
+    result = HANDLER.report_file_run(api, status, EXISTING_COMMENT_ID)
+    assert result["decision"] == decision
+    assert "stage-c-2-gpu-mi350" in api.update_calls[0][1]
+
+
+def test_report_explains_rocm_timeout_rejection(monkeypatch):
+    api = FakeAPI(pull())
+    monkeypatch.setattr(HANDLER, "_utc_now", lambda: REPORT_NOW)
+    status = file_run_status(
+        FILE_RUN_RESOLVE_RESULT="failure",
+        FILE_RUN_CUDA_RESULT="skipped",
+        FILE_RUN_ROCM_TIMEOUT="30000/9900",
+    )
+    result = HANDLER.report_file_run(api, status, EXISTING_COMMENT_ID)
+    assert result["decision"] == "FILE_RUN_FAILED"
+    assert "The ROCm file needs 30000 s but the Spur file budget is 9900 s" in api.update_calls[0][1]
+
+
 def test_report_updates_the_announced_comment_with_the_result_and_duration(monkeypatch):
     api = FakeAPI(pull())
     monkeypatch.setattr(HANDLER, "_utc_now", lambda: REPORT_NOW)
@@ -2336,7 +2443,7 @@ def test_report_updates_the_announced_comment_with_the_result_and_duration(monke
             {"FILE_RUN_CUDA_RESULT": "skipped", "FILE_RUN_CPU_RESULT": "skipped"},
             "FILE_RUN_FAILED",
             "\u274c",
-            "No execution job ran: the resolved plan selected neither the CUDA nor the CPU job.",
+            "No CPU, CUDA, or ROCm execution job ran.",
         ),
     ],
 )
@@ -2477,21 +2584,21 @@ def test_workflow_runs_only_trusted_code_with_minimal_permissions():
     assert "ref: ${{ github.sha }}" in workflow
     assert "persist-credentials: false" in workflow
     assert "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683" in workflow
-    # The command App exists only for the issues capability: label mutations
+    # This gateway mints a CI App token only for the issues capability: label mutations
     # made with GITHUB_TOKEN would never trigger the labeled CI workflows.
     assert workflow.count("actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1") == 1
-    assert workflow.count("client-id: ${{ vars.CI_COMMAND_APP_CLIENT_ID }}") == 1
-    assert workflow.count("private-key: ${{ secrets.CI_COMMAND_APP_PRIVATE_KEY }}") == 1
+    assert workflow.count("client-id: ${{ vars.CI_APP_CLIENT_ID }}") == 1
+    assert workflow.count("private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}") == 1
     assert "permission-issues: write" in workflow
     assert "permission-actions" not in workflow
     assert "CI_COMMAND_API_TOKEN: ${{ github.token }}" in workflow
     assert "CI_COMMAND_API_TOKEN: ${{ steps.issues-token.outputs.token }}" in workflow
-    assert "CI_COMMAND_APP_TOKEN" not in workflow
+    assert "CI_APP_TOKEN" not in workflow
     assert workflow.index("CI_COMMAND_PREFLIGHT") < workflow.index("actions/create-github-app-token@")
     # The actions capability never waits on the App gate; label commands fail
     # loudly when the App is not enabled instead of skipping silently.
-    assert "vars.CI_COMMAND_APP_ENABLED != 'true'" in workflow
-    assert "vars.CI_COMMAND_APP_ENABLED == 'true'" not in workflow
+    assert "vars.CI_APP_ENABLED != 'true'" in workflow
+    assert "vars.CI_APP_ENABLED == 'true'" not in workflow
     assert "steps.authorize.outputs.capability != 'none'" in workflow
     assert "steps.authorize.outputs.capability != 'issues'" in workflow
     assert "steps.authorize.outputs.capability != 'actions'" in workflow
@@ -2512,8 +2619,9 @@ def test_workflow_runs_only_trusted_code_with_minimal_permissions():
     assert "\n          permission-issues: write\n" in issues_token
     assert "\n          permission-pull-requests: write\n" in issues_token
     assert "permission-pull-requests: read" not in issues_token
-    assert "Require the command App for label commands" in handle_job
-    assert handle_job.index("Require the command App for label commands") < handle_job.index(
+    assert "permission-contents" not in issues_token
+    assert "Require the CI App for label commands" in handle_job
+    assert handle_job.index("Require the CI App for label commands") < handle_job.index(
         "Mint the issues-scoped App token"
     )
     # Each GITHUB_TOKEN job scopes its own permissions; only the actions job

@@ -5,17 +5,18 @@ from miles.utils.external_utils import command_utils
 
 MODEL_NAME = "Qwen3-4B"
 MODEL_TYPE = "qwen3-4B"
-NUM_GPUS = 8
+NUM_GPUS = 4
 
 register_cuda_ci(
-    est_time=600,
-    suite="stage-c-8-gpu-h100",
+    est_time=400,
+    suite="stage-c-4-gpu-h200",
     labels=["megatron", "weight-update"],
     hardware=["hopper", "blackwell"],
+    num_gpus=4,
 )
 register_rocm_ci(
     est_time=500,
-    suite="nightly-stage-c-8-gpu-mi350",
+    suite="stage-c-4-gpu-mi350",
     labels=["megatron", "weight-update"],
 )
 
@@ -24,6 +25,7 @@ register_ci_gate(metric_key="train/ppo_kl")
 register_ci_gate(metric_key="train/train_rollout_logprob_abs_diff")
 register_ci_gate(metric_key="train/train_rollout_kl")
 register_ci_gate(metric_key="rollout/raw_reward")
+register_ci_gate(metric_key="perf/actor_train_mfu")
 
 
 def prepare():
@@ -36,7 +38,7 @@ def prepare():
 
 def execute():
     U = command_utils.default_config().create_backend()
-    ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME}/ " f"--ref-load /root/{MODEL_NAME}_torch_dist "
+    ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME}/ " f"--ref-load /root/models/{MODEL_NAME}_torch_dist "
 
     rollout_args = (
         "--prompt-data /root/datasets/dapo-math-17k/dapo-math-17k.jsonl "
@@ -58,7 +60,7 @@ def execute():
         "--tensor-model-parallel-size 2 "
         "--sequence-parallel "
         "--pipeline-model-parallel-size 1 "
-        "--context-parallel-size 2 "
+        "--context-parallel-size 1 "
         "--recompute-granularity full "
         "--recompute-method uniform "
         "--recompute-num-layers 1 "
@@ -85,7 +87,7 @@ def execute():
     )
 
     sglang_args = (
-        "--rollout-num-gpus-per-engine 2 " f"--rollout-num-gpus {NUM_GPUS // 2} " "--sglang-mem-fraction-static 0.8 "
+        "--rollout-num-gpus-per-engine 1 " f"--rollout-num-gpus {NUM_GPUS // 2} " "--sglang-mem-fraction-static 0.8 "
     )
 
     ci_args = "--ci-test "

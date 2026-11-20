@@ -65,11 +65,11 @@ class _MockTITOTokenizer(TITOTokenizer):
 
 
 def _make_mock_tito(tito_cls, allowed_append_roles: list[str]) -> TITOTokenizer:
-    configured_tito_cls = type(
-        f"_Configured{tito_cls.__name__}",
-        (tito_cls,),
-        {"FIXED_TEMPLATE": FixedTemplate(allowed_append_roles=frozenset(allowed_append_roles))},
-    )
+    return _make_mock_tito_for(tito_cls, FixedTemplate(allowed_append_roles=frozenset(allowed_append_roles)))
+
+
+def _make_mock_tito_for(tito_cls, fixed_template: FixedTemplate) -> TITOTokenizer:
+    configured_tito_cls = type(f"_Configured{tito_cls.__name__}", (tito_cls,), {"FIXED_TEMPLATE": fixed_template})
     return configured_tito_cls(tokenizer=None, assistant_start_str="<|im_start|>assistant")
 
 
@@ -342,6 +342,69 @@ class TestSingleUserTurnPretokenized:
         t2_msgs = [SYS_MSG, extra_sys, USER_MSG, ASSISTANT_MSG_1, TOOL_MSG_1]
         result = _prepare(session, t2_msgs, tito_tokenizer=registry.tito_tokenizer)
         assert result == [1, 2, 3, 4, 10, 11]
+
+
+# A family whose renderer takes only tool answers after a tool call and no tool message without one.
+_NARROW_CONTINUATIONS = FixedTemplate(
+    allowed_append_roles=frozenset({"tool", "user", "assistant"}),
+    roles_after_tool_call=frozenset({"tool"}),
+    roles_after_no_tool_call=frozenset({"user", "assistant"}),
+)
+_FOLLOWUP_USER_MSG = {"role": "user", "content": "And Shanghai?"}
+_INJECTED_ASSISTANT_MSG = {"role": "assistant", "content": "The earlier result was sunny."}
+_SENTINEL_TOOL_MSG = {"role": "tool", "content": '{"result": "unavailable"}', "tool_call_id": "none"}
+
+
+class TestContinuationRoles:
+    """The family's continuation roles refuse a message right after an assistant with a 400."""
+
+    @pytest.mark.parametrize(
+        "stored_assistant,appended,accepted",
+        [
+            (ASSISTANT_MSG_1, [TOOL_MSG_1], True),
+            (ASSISTANT_MSG_1, [TOOL_MSG_1, _FOLLOWUP_USER_MSG], True),
+            (ASSISTANT_MSG_1, [_FOLLOWUP_USER_MSG], False),
+            (ASSISTANT_MSG_1, [_INJECTED_ASSISTANT_MSG], False),
+            (ASSISTANT_MSG_FINAL, [_FOLLOWUP_USER_MSG], True),
+            (ASSISTANT_MSG_FINAL, [_SENTINEL_TOOL_MSG], False),
+            (ASSISTANT_MSG_FINAL, [_INJECTED_ASSISTANT_MSG, _SENTINEL_TOOL_MSG], False),
+        ],
+        ids=[
+            "tool-after-call",
+            "user-after-answered-call",
+            "user-after-call",
+            "assistant-after-call",
+            "user-after-answer",
+            "tool-after-answer",
+            "tool-after-injected-assistant",
+        ],
+    )
+    def test_refusal_is_a_400_that_leaves_the_tree_unchanged(self, stored_assistant, appended, accepted):
+        tito = _make_mock_tito_for(_MockTITOTokenizer, _NARROW_CONTINUATIONS)
+        registry = SessionRegistryV2(tokenizer=None, tito_tokenizer=tito)
+        session = registry.get_session(registry.create_session())
+        _commit(session, [SYS_MSG, USER_MSG], stored_assistant, [1, 2, 3], [10])
+        messages = [SYS_MSG, USER_MSG, stored_assistant, *appended]
+
+        if accepted:
+            _prepare(session, messages, tito_tokenizer=tito)
+            return
+        with pytest.raises(MessageValidationError, match="after an assistant (with|without) tool_calls") as error:
+            _prepare(session, messages, tito_tokenizer=tito)
+        assert error.value.status_code == 400
+        assert len(session.tree.nodes) == 1
+        assert _messages(session) == [SYS_MSG, USER_MSG, stored_assistant]
+
+    def test_new_root_is_left_to_the_renderer(self):
+        """A from-scratch render is not checked: a family can render a turn it cannot append."""
+        tito = _make_mock_tito_for(_MockTITOTokenizer, _NARROW_CONTINUATIONS)
+        registry = SessionRegistryV2(tokenizer=None, tito_tokenizer=tito)
+        session = registry.get_session(registry.create_session())
+
+        token_ids = _prepare(session, [SYS_MSG, USER_MSG, ASSISTANT_MSG_1, _FOLLOWUP_USER_MSG], tito_tokenizer=tito)
+
+        assert token_ids == _MOCK_FIRST_TURN_TOKENS
+        assert len(session.tree.nodes) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -982,43 +1045,36 @@ class TestComputeSessionMismatch:
         assert mock_tokenize.call_args.kwargs["template_args"] == {"reasoning_effort": "low"}
 
 
-def test_committed_full_turn_args_are_isolated_between_siblings(registry):
+def test_committed_full_turn_args_are_each_siblings_own_request(registry):
+    """One copy: each node keeps the request it committed itself, read-only from then on."""
     session = registry.get_session(registry.create_session())
-    request_args = {"temperature": 0.7, "chat_template_kwargs": {"nested": [1]}, "input_ids": [1, 2]}
-    record = SessionRecord(
-        timestamp=1.0, method="POST", path="/v1/chat/completions", status_code=200, request=request_args, response={}
-    )
-    first = commit_generation(
-        session,
-        parent=None,
-        request_messages=[SYS_MSG, USER_MSG],
-        assistant_message=ASSISTANT_MSG_1,
-        prompt_token_ids=[1, 2],
-        completion_token_ids=[3],
-        max_trim_tokens=0,
-        record=record,
-        response_id="first",
-        finish_reason="stop",
-        turn_args=request_args,
-    )
-    request_args["temperature"] = 0.1
-    request_args["chat_template_kwargs"]["nested"].append(2)
-    second = commit_generation(
-        session,
-        parent=None,
-        request_messages=[SYS_MSG, USER_MSG],
-        assistant_message=ASSISTANT_MSG_1,
-        prompt_token_ids=[1, 2],
-        completion_token_ids=[4],
-        max_trim_tokens=0,
-        record=record,
-        response_id="second",
-        finish_reason="stop",
-        turn_args=request_args,
-    )
-    request_args["input_ids"].append(9)
-    assert first.turn_args == {"temperature": 0.7, "chat_template_kwargs": {"nested": [1]}, "input_ids": [1, 2]}
-    assert second.turn_args == {"temperature": 0.1, "chat_template_kwargs": {"nested": [1, 2]}, "input_ids": [1, 2]}
+    nodes = []
+    for response_id, temperature, completion in (("first", 0.7, 3), ("second", 0.1, 4)):
+        request_args = {"temperature": temperature, "chat_template_kwargs": {"nested": [1]}, "input_ids": [1, 2]}
+        record = SessionRecord(
+            timestamp=1.0,
+            method="POST",
+            path="/v1/chat/completions",
+            status_code=200,
+            request=request_args,
+            response={},
+        )
+        node = commit_generation(
+            session,
+            parent=None,
+            request_messages=[SYS_MSG, USER_MSG],
+            assistant_message=ASSISTANT_MSG_1,
+            prompt_token_ids=[1, 2],
+            completion_token_ids=[completion],
+            max_trim_tokens=0,
+            record=record,
+            response_id=response_id,
+            finish_reason="stop",
+            turn_args=request_args,
+        )
+        assert node.turn_args is request_args
+        nodes.append(node)
+    assert [node.turn_args["temperature"] for node in nodes] == [0.7, 0.1]
 
 
 def test_mismatch_does_not_resolve_defaults_for_an_empty_committed_record(registry):

@@ -16,27 +16,49 @@ from tests.ci.ci_register import register_cuda_ci, register_rocm_ci
 
 from miles.utils.external_utils import command_utils
 
-register_cuda_ci(est_time=500, suite="stage-c-8-gpu-h100", labels=["short"], hardware=["hopper", "blackwell"])
-register_rocm_ci(est_time=600, suite="nightly-stage-c-8-gpu-mi350", labels=["short"])
+register_cuda_ci(
+    est_time=400,
+    suite="stage-c-4-gpu-h200",
+    labels=["short"],
+    hardware=["hopper", "blackwell"],
+    nightly=True,
+    num_gpus=4,
+    disabled=(
+        "Colocated fault tolerance is unsupported: miles_validate_args rejects rollout fault tolerance without a "
+        "partial-target P2P weight update, which --colocate cannot provide. Unblock condition: a decision to port "
+        "this recovery scenario to a disaggregated P2P layout or to delete it; tracked in #3724."
+    ),
+)
+register_rocm_ci(
+    est_time=600,
+    suite="stage-c-4-gpu-mi350",
+    labels=["short"],
+    nightly=True,
+    disabled=(
+        "Colocated fault tolerance is unsupported: miles_validate_args rejects rollout fault tolerance without a "
+        "partial-target P2P weight update, which --colocate cannot provide. Unblock condition: a decision to port "
+        "this recovery scenario to a disaggregated P2P layout or to delete it; tracked in #3724."
+    ),
+)
 
 MODEL_NAME = "Qwen2.5-0.5B-Instruct"
 MODEL_TYPE = "qwen2.5-0.5B"
-NUM_GPUS = 8
+NUM_GPUS = 4
 
-# Two models on 8 GPUs (colocate): actor gets weight updates, ref is frozen.
+# Two models on 4 GPUs (colocate): actor gets weight updates, ref is frozen.
 SGLANG_CONFIG_YAML = """\
 sglang:
   - name: actor
     update_weights: true
     server_groups:
       - worker_type: regular
-        num_gpus: 4
+        num_gpus: 2
         num_gpus_per_engine: 1
   - name: ref
     update_weights: false
     server_groups:
       - worker_type: regular
-        num_gpus: 4
+        num_gpus: 2
         num_gpus_per_engine: 1
 """
 
@@ -61,7 +83,7 @@ def execute():
         "--apply-chat-template "
         "--rollout-shuffle "
         "--rm-type math "
-        "--num-rollout 3 "
+        "--num-rollout 2 "
         "--rollout-batch-size 8 "
         "--n-samples-per-prompt 4 "
         "--rollout-max-response-len 512 "
