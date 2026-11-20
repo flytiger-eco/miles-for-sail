@@ -117,7 +117,7 @@ RUN set -e && SP=/usr/local/lib/python3.12/site-packages \
     && find $SP/sglang -name '__pycache__' -type d -exec rm -rf {} +
 
 # Kernel ecosystem (flytiger art source resolves platform-customized builds)
-RUN pip install "tilelang==0.1.8" "deep_gemm>=1.1.0" flash_mla "acext>=1.1.0" && \
+RUN pip install "tilelang==0.1.8+v0.2.0.ppu2.2.0" "deep_gemm>=1.1.0" flash_mla "acext>=1.1.0" && \
     pip install "flashinfer_python==0.6.17+v0.1.0.ppu2.2.1" --no-deps && \
     pip install "apache-tvm-ffi==0.1.11"
 
@@ -138,10 +138,13 @@ RUN pip install "mooncake==0.3.12.post1+v0.1.0.ppu2.2.0" && \
     python3 -c "from mooncake.store import MooncakeDistributedStore; print('mooncake install check OK')"
 
 # tile_kernels: DeepSeek-V4 plugin dep; --no-deps (wheel declares
-# tilelang>=0.1.9, the platform build is 0.1.8)
+# tilelang>=0.1.9, the platform build is 0.1.8+v0.2.0.ppu2.2.0). Pin the
+# local version explicitly: the art index also hosts 0.1.8+v0.2.0.ppu2.2.1,
+# and the resolver backtracks to the 0.1.8+v0.2.0.ppu2.2.0 build while
+# resolving this step's shared dependencies.
 RUN pip install --no-deps "tile_kernels==1.0.0" && \
     python3 -c "from tile_kernels.quant import per_token_cast_back" && \
-    python3 -c "import tilelang; assert tilelang.__version__ == '0.1.8+v0.2.0.ppu2.2.1', tilelang.__version__"
+    python3 -c "import tilelang; assert tilelang.__version__ == '0.1.8+v0.2.0.ppu2.2.0', tilelang.__version__"
 
 # sglang-router + sgl-model-gateway: the OFFICIAL miles custom build
 # (radixark/sgl-router-for-miles @a0cf7da5; GenerateRequest has 51 fields incl.
@@ -441,7 +444,7 @@ RUN printf '%s\n' \
     "deep_ep=2.2.2+v0.1.0.ppu2.2.1 (deepep.py top-level Buffer hard dep)" \
     "nvidia-modelopt=0.47.0 (glm5 plugin import chain)" \
     "pyarrow=25.0.1 (numpy 1.26.4 compat line)" \
-    "ray=2.58.0 torchft-nightly=2026.4.3 tilelang=0.1.8+v0.2.0.ppu2.2.1" \
+    "ray=2.58.0 torchft-nightly=2026.4.3 tilelang=0.1.8+v0.2.0.ppu2.2.0" \
     "sglang-router=0.3.2 OFFICIAL (radixark/miles-wheels, 51-field GenerateRequest w/ return_routed_experts) + sgl-model-gateway 0.3.2 (/usr/local/bin); NOT the art-source build" \
     "fake_int4_quant_cuda=0.0.0 (official source miles int4_fake, platform nvcc build)" \
     "torchtitan=0.3.0 @086bf6c (editable --no-deps) spmd_types=0.2.3 tyro>=1.0.5 torchdata=0.11.0+v0.1.0.ppu2.2.1" \
