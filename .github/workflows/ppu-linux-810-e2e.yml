@@ -127,13 +127,15 @@ jobs:
 
   qwen35-e2e:
     name: ppu-e2e qwen3.5-35b training (810E 8 cards)
-    if: github.event_name == 'workflow_dispatch' && inputs.run_qwen35
+    if: github.event_name != 'workflow_dispatch' || inputs.run_qwen35
     runs-on: k8s-runner-group-cpu-flytiger
     container:
       image: ghcr.io/actions/actions-runner:latest
     timeout-minutes: 420
     env:
-      Q35_MODE: ${{ inputs.qwen35_mode }}
+      # PR/push events carry no dispatch inputs: default the mode so the
+      # typer Literal never receives an empty string.
+      Q35_MODE: ${{ inputs.qwen35_mode || 'normal' }}
       Q35_EXTRA_ARGS: ${{ inputs.qwen35_extra_args }}
 
     steps:
