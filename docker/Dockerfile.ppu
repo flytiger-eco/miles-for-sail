@@ -122,9 +122,9 @@ RUN pip install "tilelang==0.1.8" "deep_gemm>=1.1.0" flash_mla "acext>=1.1.0" &&
     pip install "apache-tvm-ffi==0.1.11"
 
 # flash_attn_3 (TE dual-package form; fa2 v2 is Step 7)
-RUN pip install "flash_attn_3==2.8.2+v0.2.0.ppu2.2.1" \
+RUN pip install "flash_attn_3==3.0.0+v0.2.0.ppu2.2.1" \
         -i https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple && \
-    python3 -c "import importlib.metadata as im; assert im.version('flash-attn-3') == '2.8.2+v0.2.0.ppu2.2.1', im.version('flash-attn-3')"
+    python3 -c "import importlib.metadata as im; assert im.version('flash-attn-3') == '3.0.0+v0.2.0.ppu2.2.1', im.version('flash-attn-3')"
 
 # pla: linear-attention kernels for the sglang FLA-family (KDA/GDN) rollout
 RUN pip install "pla==1.0.0+v0.1.0.ppu2.2.0" && \
@@ -431,7 +431,7 @@ RUN printf '%s\n' \
     "sglang=0.5.21 (art-source prebuilt whl 0.5.21+v0.1.0.ppu2.2.1 sha256=dbf9fa16461e26045a58cc2033fb9369cf11b10ceba5f5a66976a04f0b368c0c; runtime-port merge patch 176 files (gen pin @${SAIL_PIN}) + EAGLE draft oc replay/restore + decode-graph recapture patch (2 files); applied on site-packages)" \
     "megatron=${MEGATRON_COMMIT} (radixark/Megatron-LM miles-main; editable; megatron-core 0.19.0)" \
     "transformer_engine=2.16+v0.1.0.ppu2.2.1 apex=24.4.1+v0.1.0.ppu2.2.1 (int4_qat kernel bundled)" \
-    "flash-attn=2.8.2+v0.2.0.ppu2.2.1 + flash-attn-3 2.8.2+v0.2.0.ppu2.2.1 (TE dual-package form)" \
+    "flash-attn=2.8.2+v0.2.0.ppu2.2.1 + flash-attn-3 3.0.0+v0.2.0.ppu2.2.1 (TE dual-package form)" \
     "flash-linear-attention=0.5.2+4ce9e47.ppu2.2.0 fork (shell + fla-core split package) + KDA hoist patch" \
     "pla=1.0.0+v0.1.0.ppu2.2.0 (linear-attn kernels; sglang FLA-family rollout path)" \
     "mooncake=0.3.12.post1+v0.1.0.ppu2.2.0 (mooncake_transfer_engine; mooncake_master + MooncakeDistributedStore)" \
