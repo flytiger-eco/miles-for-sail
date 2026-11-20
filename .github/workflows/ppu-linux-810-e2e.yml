@@ -1,0 +1,195 @@
+# Copyright © 2026 Zhejiang Runhe Cloud Intelligence Technology Co., Ltd
+
+name: ppu-linux-810-e2e
+
+on:
+  pull_request:
+    branches:
+      - v*
+    paths:
+      - '.github/workflows/ppu-linux-810-e2e.yml'
+      - 'tests/e2e/**'
+      - 'miles/**'
+  push:
+    branches:
+      - v*
+    paths:
+      - '.github/workflows/ppu-linux-810-e2e.yml'
+      - 'tests/e2e/**'
+      - 'miles/**'
+  workflow_dispatch:
+    inputs:
+      run_quick_start:
+        description: 'Run the 2-card quick-start end-to-end case'
+        required: false
+        type: boolean
+        default: true
+      run_qwen35:
+        description: 'Run the 8-card full training case (downloads and converts a 35B model first)'
+        required: false
+        type: boolean
+        default: false
+      qwen35_mode:
+        description: 'Training mode (normal / debug_minimal)'
+        required: false
+        type: string
+        default: 'normal'
+      qwen35_extra_args:
+        description: 'Extra arguments passed through to the training script (e.g. an aligned eval dataset)'
+        required: false
+        type: string
+        default: ''
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  IMAGE: ghcr.io/flytiger-eco/miles-for-sail:miles
+  NAMESPACE: ppu-sched
+  HOST_VOLUMES: "/nas_aisw:/nas_aisw,/wl_nas:/mnt/wl_nas"
+  SOURCE_DIR: /workspace/source
+  NODE_SELECTOR: "board-type=OAM-810E"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  quick-start-e2e:
+    name: ppu-e2e quick-start (810E 2 cards)
+    if: github.event_name != 'workflow_dispatch' || inputs.run_quick_start
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 240
+
+    steps:
+      - name: Checkout miles-for-sail
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Wait before retry (checkout)
+        if: steps.checkout.outcome == 'failure'
+        run: sleep 15
+
+      - name: Checkout miles-for-sail (retry)
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: "810 run quick-start end-to-end case"
+        uses: flytiger-eco/shared-workflows/cluster-task@main
+        with:
+          nnodes: 0
+          nproc_per_node: 2
+          node_selector: ${{ env.NODE_SELECTOR }}
+          host_volumes: ${{ env.HOST_VOLUMES }}
+          image: ${{ env.IMAGE }}
+          namespace: ${{ env.NAMESPACE }}
+          source_dir: ${{ env.SOURCE_DIR }}
+          timeout_minutes: 180
+
+          command: |
+            bash <<'PPU_MILES_E2E'
+            set -uo pipefail
+            cd "${{ env.SOURCE_DIR }}"
+            # git in the pod sees the unpacked checkout as a foreign owner
+            # ("dubious ownership", exit 128); tests that shell out to git
+            # need this to pass.
+            git config --global --add safe.directory "${PWD}" || true
+            export HF_ENDPOINT=https://hf-mirror.com
+            # Mirror downloads can fail mid-transfer with read timeouts; the
+            # case downloads model and dataset itself and completed downloads
+            # resume, so retry a bounded number of times before giving up.
+            rc=1
+            for attempt in 1 2 3; do
+              if CUDA_VISIBLE_DEVICES=0,1 \
+                 python3 tests/e2e/short/test_qwen2.5_0.5B_gsm8k_short.py; then
+                rc=0
+                break
+              fi
+              rc=$?
+              echo "[ppu-miles-e2e] attempt ${attempt} failed (exit=${rc}); retrying after a pause"
+              sleep 30
+            done
+            echo "[ppu-miles-e2e] done (exit=${rc})"
+            exit "${rc}"
+            PPU_MILES_E2E
+
+  qwen35-e2e:
+    name: ppu-e2e qwen3.5-35b training (810E 8 cards)
+    if: github.event_name == 'workflow_dispatch' && inputs.run_qwen35
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 420
+    env:
+      Q35_MODE: ${{ inputs.qwen35_mode }}
+      Q35_EXTRA_ARGS: ${{ inputs.qwen35_extra_args }}
+
+    steps:
+      - name: Checkout miles-for-sail
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Wait before retry (checkout)
+        if: steps.checkout.outcome == 'failure'
+        run: sleep 15
+
+      - name: Checkout miles-for-sail (retry)
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: "810 run qwen3.5-35b end-to-end training"
+        uses: flytiger-eco/shared-workflows/cluster-task@main
+        with:
+          nnodes: 0
+          nproc_per_node: 8
+          node_selector: ${{ env.NODE_SELECTOR }}
+          host_volumes: ${{ env.HOST_VOLUMES }}
+          image: ${{ env.IMAGE }}
+          namespace: ${{ env.NAMESPACE }}
+          source_dir: ${{ env.SOURCE_DIR }}
+          timeout_minutes: 360
+
+          command: |
+            bash <<'PPU_MILES_E2E_TRAIN'
+            set -uo pipefail
+            cd "${{ env.SOURCE_DIR }}"
+            git config --global --add safe.directory "${PWD}" || true
+            export HF_ENDPOINT=https://hf-mirror.com
+            # Hardware auto-detection only knows accelerator names listed in
+            # the training utility; select an 8-card single-node topology
+            # explicitly so model conversion and training agree on 8 ranks.
+            args=(
+              --hardware H200
+              --parallelism tp1-ep8
+              --rollout-max-response-len 8192
+              --sglang-ep-size 8
+              --sglang-max-running-requests 512
+              --enable-eval
+              --mode "${Q35_MODE}"
+            )
+            if [[ -n "${Q35_EXTRA_ARGS}" ]]; then
+              args+=(--extra-args "${Q35_EXTRA_ARGS}")
+            fi
+            echo "[ppu-miles-e2e] launching training with: ${args[*]}"
+            python3 scripts/run_qwen3_5_35b_a3b_mtp.py "${args[@]}"
+            rc=$?
+            echo "[ppu-miles-e2e-train] done (exit=${rc})"
+            exit "${rc}"
+            PPU_MILES_E2E_TRAIN
