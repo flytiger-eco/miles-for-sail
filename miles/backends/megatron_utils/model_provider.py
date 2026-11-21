@@ -41,6 +41,9 @@ def _apply_bridge_runtime_config(provider, args: TrainerConfig) -> None:
     parallelism, memory, and numerics settings that really come from args. Put
     new training flags here, not spread across the code.
     """
+    # imported here: conftest's apply_bridge_runtime_config fixture execs this function without the module's imports
+    from miles.utils.megatron_bridge_utils import apply_dsa_backend_args, apply_pipeline_layout, apply_precision_args
+
     # Bridge providers may default to frozen parts (Qwen3-VL MoE freezes the language model and ViT);
     # start from fully trainable and let miles args freeze parts below.
     for freeze_field in ("freeze_language_model", "freeze_vision_model", "freeze_vision_projection"):
@@ -88,9 +91,8 @@ def _apply_bridge_runtime_config(provider, args: TrainerConfig) -> None:
     # communication overlap
     provider.tp_comm_overlap = args.backend.tp_comm_overlap
 
-    # fp8
-    provider.fp8 = args.backend.fp8
-    provider.fp8_recipe = args.backend.fp8_recipe
+    # before the fake-QAT check below, which reads fp8 / fp4
+    apply_precision_args(provider, args)
 
     # attention kernel selection
     provider.attention_backend = args.backend.attention_backend
@@ -107,21 +109,13 @@ def _apply_bridge_runtime_config(provider, args: TrainerConfig) -> None:
     # MoE token dispatcher (same-name, always present)
     provider.moe_token_dispatcher_type = args.backend.moe_token_dispatcher_type
 
-    # arg name != provider field; arg default None, so propagate only when the user set it
-    if args.backend.decoder_first_pipeline_num_layers is not None:
-        provider.num_layers_in_first_pipeline_stage = args.backend.decoder_first_pipeline_num_layers
-    if args.backend.decoder_last_pipeline_num_layers is not None:
-        provider.num_layers_in_last_pipeline_stage = args.backend.decoder_last_pipeline_num_layers
-
     # MoE training knobs: override only when explicitly set, else keep the provider's value
     if args.backend.moe_router_bias_update_rate is not None:
         provider.moe_router_bias_update_rate = args.backend.moe_router_bias_update_rate
     if args.backend.moe_aux_loss_coeff is not None:
         provider.moe_aux_loss_coeff = args.backend.moe_aux_loss_coeff
 
-    # Imported here: test_bridge_mtp_detachment.py exec()s this function's AST in a bare namespace (no module names).
-    from miles.utils.megatron_bridge_utils import apply_dsa_backend_args
-
+    apply_pipeline_layout(provider, args)
     apply_dsa_backend_args(provider, args)
 
 

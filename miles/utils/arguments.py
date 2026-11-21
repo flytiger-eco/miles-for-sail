@@ -24,7 +24,6 @@ from miles.backends.sglang_utils.sglang_config import SglangConfig
 from miles.backends.sglang_utils.sglang_scaling_config import SglangScalingConfig
 from miles.backends.torchtitan_utils.args_namespace import TorchtitanArgsNamespace
 from miles.backends.training_utils.data.token_space_media_process import RolloutEngineProcessorArgs
-from miles.dashboard.args import validate_dashboard_args
 from miles.ray.specs.train import external_trainer_controller_addrs
 from miles.rollout.checkpoint_eval import is_checkpoint_eval_fn
 from miles.rollout.reward_shaping import validate_length_penalty_args
@@ -1075,6 +1074,32 @@ def _resolve_allow_stop_token_replace(args: argparse.Namespace) -> bool:
     return allowed
 
 
+def _resolve_allow_truncated_continuation(args: argparse.Namespace) -> bool:
+    if not args.use_session_server:
+        if args.allow_truncated_continuation is not None:
+            raise ValueError(
+                "--allow-truncated-continuation requires --use-session-server; "
+                "this flag only configures the session-server TITO middleware."
+            )
+        return False
+    fixed_template = TITOTokenizerType.get_tokenizer_class(TITOTokenizerType(args.tito_model)).FIXED_TEMPLATE
+    family_default = fixed_template.truncation_closer is not None
+    if args.allow_truncated_continuation and not family_default:
+        raise ValueError(
+            f"--allow-truncated-continuation is not supported with --tito-model={args.tito_model}: "
+            "this family declares no closer for a turn cut by finish_reason=length."
+        )
+    # An explicit flag wins over the --tito-model family default.
+    allowed = family_default if args.allow_truncated_continuation is None else args.allow_truncated_continuation
+    source = (
+        f"--tito-model={args.tito_model} default"
+        if args.allow_truncated_continuation is None
+        else "explicit --allow-truncated-continuation"
+    )
+    logger.info(f"Session server truncated-turn continuation {'allowed' if allowed else 'rejected'} ({source})")
+    return allowed
+
+
 def _check_stop_token_replace_streaming_session(args: argparse.Namespace, *, sglang: SglangConfig) -> None:
     if args.allow_stop_token_replace and sglang.common_value("enable_streaming_session"):
         raise ValueError(
@@ -1086,10 +1111,27 @@ def _check_stop_token_replace_streaming_session(args: argparse.Namespace, *, sgl
         )
 
 
+_REMOVED_DASHBOARD_ARGS = {
+    "use_miles_dashboard": "install packages/miles-dashboard and set MILES_DASHBOARD=1 instead",
+    "dashboard_flush_interval": "set MILES_DASHBOARD_FLUSH_INTERVAL instead",
+    "dashboard_gpu_sample_interval": "set MILES_DASHBOARD_GPU_SAMPLE_INTERVAL instead",
+    "dashboard_sglang_scrape_interval": "set MILES_DASHBOARD_SGLANG_SCRAPE_INTERVAL instead",
+    "dashboard_sglang_metrics": "set MILES_DASHBOARD_SGLANG_METRICS instead",
+    "dashboard_forward_prometheus": "set MILES_DASHBOARD_FORWARD_PROMETHEUS=1 instead",
+    "dashboard_sglang_scrape_mode": "drop it: the dashboard always scrapes each engine directly",
+}
+
+
 def _apply_custom_config(args, data: dict) -> None:
     # configs written before --router
     if data.pop("use_miles_router", False):
         data["router"] = RouterKind.MILES
+    # configs written before the dashboard read environment variables
+    if removed := [key for key in data if key in _REMOVED_DASHBOARD_ARGS]:
+        raise ValueError(
+            "The --custom-config-path file sets dashboard arguments that no longer exist: "
+            + ", ".join(f"{key} ({_REMOVED_DASHBOARD_ARGS[key]})" for key in removed)
+        )
     for k, v in data.items():
         if hasattr(args, k):  # config-access-exempt: attribute selected at runtime from k
             logger.info(
@@ -1159,7 +1201,6 @@ def miles_validate_args(args):
             "Without --colocate, --rollout-routed-expert-format mxfp4 supports only the packed transfer mode, "
             f"not {mode!r}; use --update-weight-transfer-mode broadcast_packed."
         )
-    validate_dashboard_args(args)
     validate_miles_ext_kernels_args(args)
 
     args.ft_components = _resolve_ft_components(args)
@@ -1295,6 +1336,7 @@ def miles_validate_args(args):
         )
 
     args.allow_stop_token_replace = _resolve_allow_stop_token_replace(args)
+    args.allow_truncated_continuation = _resolve_allow_truncated_continuation(args)
 
     if args.debug_disable_optimizer:
         args.no_load_optim = True
@@ -1970,9 +2012,6 @@ def miles_validate_args(args):
 
     if ClusterBackend(args.cluster_backend) == ClusterBackend.KUBERNETES:
         assert (
-            not args.use_miles_dashboard
-        ), "--use-miles-dashboard creates a Ray actor, which --cluster-backend kubernetes has no Ray cluster for"
-        assert (
             not args.use_distributed_post
         ), "--use-distributed-post reads ray.nodes(), which --cluster-backend kubernetes has no Ray cluster for"
         assert (
@@ -2134,8 +2173,6 @@ def validate_compile_warmup(args) -> None:
             ("--context-parallel-size", args.context_parallel_size > 1),
             ("--multimodal-keys", args.multimodal_keys is not None),
             ("--multimodal-token-space-processing", args.multimodal_token_space_processing),
-            ("--use-rollout-routing-replay", args.use_rollout_routing_replay),
-            ("--use-routing-replay", args.use_routing_replay),
             ("--use-opd", args.use_opd),
             ("--use-critic", args.use_critic),
             ("--enable-witness", args.enable_witness),
@@ -2148,6 +2185,10 @@ def validate_compile_warmup(args) -> None:
                 args.custom_convert_samples_to_train_data_path is not None,
             ),
             ("--custom-reward-post-process-path", args.custom_reward_post_process_path is not None),
+            (
+                "--use-routing-replay without --use-rollout-routing-replay",
+                args.use_routing_replay and not args.use_rollout_routing_replay,
+            ),
         )
         if enabled
     ]

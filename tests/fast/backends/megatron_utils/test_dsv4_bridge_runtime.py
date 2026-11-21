@@ -2,12 +2,14 @@ import dataclasses
 from types import SimpleNamespace
 
 import pytest
+from tests.fast.fixtures.bridge_precision_fixtures import BRIDGE_PRECISION_ARG_DEFAULTS
 
 from miles.backends.megatron_utils.model_provider import _apply_bridge_runtime_config
 
 
 def _runtime_args(**overrides):
     values = {
+        **BRIDGE_PRECISION_ARG_DEFAULTS,
         "tensor_model_parallel_size": 1,
         "pipeline_model_parallel_size": 8,
         "expert_model_parallel_size": 4,
@@ -36,6 +38,7 @@ def _runtime_args(**overrides):
         "moe_token_dispatcher_type": "alltoall",
         "decoder_first_pipeline_num_layers": 4,
         "decoder_last_pipeline_num_layers": 3,
+        "pipeline_model_parallel_layout": None,
         "moe_router_bias_update_rate": None,
         "moe_aux_loss_coeff": None,
     }
