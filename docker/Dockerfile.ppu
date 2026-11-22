@@ -394,22 +394,24 @@ RUN pip install --force-reinstall --no-deps \
     python3 -c "import transformer_engine as te; from transformer_engine.pytorch.attention.dot_product_attention import backends; assert backends.flash_attn_func is not None, 'TE fa2 path broken'; print('TE flash-attn dual package OK')"
 
 # =====================================================================
-# Step 8: FLA 0.5.2 fork install + KDA hoist + sglang-kernel
+# Step 8: FLA 0.5.2 original install + KDA hoist + sglang-kernel
 # =====================================================================
 
-# fla: fork (flash-linear-attention-for-sail 0.5.2) from the art index.
+# fla: ORIGINAL PyPI 0.5.2. The art index has no 0.5.2 fork (only 0.4.1
+# platform builds, confirmed against the pypi_generic index.json + storage
+# listing), and the shipped v0.1.2 image runs the original split package:
+# flash-linear-attention 0.5.2 shell + fla-core 0.5.2 core.
 # NOT --no-deps: the shell's real payload is its dependency on fla-core
-# (carries the triton kernels; resolves to the same fork wheel).
+# (carries the triton kernels).
 RUN set -e; SP=/usr/local/lib/python3.12/site-packages; \
     pip uninstall -y flash-linear-attention fla-core 2>/dev/null || true; \
     rm -rf $SP/fla /tmp/fla-src; \
     pip install --no-cache-dir -c /tmp/miles_constraints.txt \
-        -i https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple \
-        "flash_linear_attention==0.5.2+4ce9e47.ppu2.2.0" && \
+        -i https://pypi.org/simple "flash-linear-attention==0.5.2" && \
     python3 -c "import importlib.metadata as im; \
-assert im.version('flash-linear-attention') == '0.5.2+4ce9e47.ppu2.2.0', im.version('flash-linear-attention'); \
-assert im.version('fla-core') == '0.5.2+4ce9e47.ppu2.2.0', im.version('fla-core')" && \
-    python3 -c "import fla.ops.kda.chunk_intra_token_parallel; print('fla fork 0.5.2 (shell+core) OK')"
+assert im.version('flash-linear-attention') == '0.5.2', im.version('flash-linear-attention'); \
+assert im.version('fla-core') == '0.5.2', im.version('fla-core')" && \
+    python3 -c "import fla.ops.kda.chunk_intra_token_parallel; print('fla PyPI 0.5.2 (shell+core) OK')"
 
 # KDA hoist (upstream PR #1108): hoist the BK constexpr out of the @triton.jit
 # kernel body into the signature
@@ -450,14 +452,14 @@ RUN pip install "https://pkg.flytiger-eco.com/artifactory/pypi_generic//sglang_k
 ENV HF_HUB_DISABLE_XET=1
 
 RUN printf '%s\n' \
-    "image=miles-sail v0.1.2 (this repo build context; art-source prebuilt sglang wheel + site-packages patches + fla fork 0.5.2; zero wheel files in build context)" \
+    "image=miles-sail v0.1.2 (this repo build context; art-source prebuilt sglang wheel + site-packages patches + original fla 0.5.2 PyPI; zero wheel files in build context)" \
     "base=pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.1-2.13.0-ubuntu24.04-cuda13.0-py312-20261103" \
     "miles_branch=${MILES_BRANCH} (this repo's v0.1.2 branch COPY'd at build time + in-tree adaptations: colocate IPC barrier + GPU id sortkey)" \
     "sglang=0.5.21 (art-source prebuilt whl 0.5.21+v0.1.0.ppu2.2.1 sha256=dbf9fa16461e26045a58cc2033fb9369cf11b10ceba5f5a66976a04f0b368c0c; runtime-port merge patch 176 files (gen pin @${SAIL_PIN}) + EAGLE draft oc replay/restore + decode-graph recapture patch (2 files); applied on site-packages)" \
     "megatron=${MEGATRON_COMMIT} (radixark/Megatron-LM miles-main; editable; megatron-core 0.19.0)" \
     "transformer_engine=2.16+v0.1.0.ppu2.2.0 apex=24.4.1+v0.1.0.ppu2.2.0 (int4_qat kernel bundled; ppu2.2.0-generation wheels, supported on SDK 2.2.1)" \
     "flash-attn=2.8.2+v0.2.0.ppu2.2.1 + flash-attn-3 3.0.0+v0.2.0.ppu2.2.1 (TE dual-package form)" \
-    "flash-linear-attention=0.5.2+4ce9e47.ppu2.2.0 fork (shell + fla-core split package) + KDA hoist patch" \
+    "flash-linear-attention=0.5.2 ORIGINAL PyPI (shell + fla-core split package; the art index hosts no 0.5.2 fork) + KDA hoist patch" \
     "pla=1.0.0+v0.1.0.ppu2.2.0 (linear-attn kernels; sglang FLA-family rollout path)" \
     "mooncake=0.3.12.post1+v0.1.0.ppu2.2.0 (mooncake_transfer_engine; mooncake_master + MooncakeDistributedStore)" \
     "tile_kernels=1.0.0 (DeepSeek-V4 plugin qat; target.patch NOT applied on tilelang 0.1.8)" \
@@ -542,8 +544,8 @@ assert "/end_weight_update" in paths, "miles route /end_weight_update missing"
 
 # fla: assert via metadata (the split-package shell overwrites fla/__init__.py)
 import fla
-assert md.version("flash-linear-attention") == "0.5.2+4ce9e47.ppu2.2.0", md.version("flash-linear-attention")
-assert md.version("fla-core") == "0.5.2+4ce9e47.ppu2.2.0", md.version("fla-core")
+assert md.version("flash-linear-attention") == "0.5.2", md.version("flash-linear-attention")
+assert md.version("fla-core") == "0.5.2", md.version("fla-core")
 from fla.ops.kda import chunk_kda  # noqa: F401
 from fla.ops.kda.gate import fused_kda_gate  # noqa: F401
 from fla.modules import FusedRMSNormGated, ShortConvolution  # noqa: F401
@@ -635,7 +637,7 @@ print(f"megatron-core           {md.version('megatron-core')}")
 print(f"transformer_engine      {md.version('transformer_engine')}")
 print(f"apex                    {md.version('apex')} (int4_qat bundled)")
 print(f"flash-attn              {md.version('flash-attn')} + flash-attn-3 {md.version('flash-attn-3')} (dual)")
-print(f"flash-linear-attention  {md.version('flash-linear-attention')} + fla-core {md.version('fla-core')} (fork, + KDA hoist)")
+print(f"flash-linear-attention  {md.version('flash-linear-attention')} + fla-core {md.version('fla-core')} (PyPI original, + KDA hoist)")
 print(f"pla                     {md.version('pla')} (linear-attn kernels, sglang rollout)")
 print(f"tile_kernels            {md.version('tile_kernels')} (DeepSeek-V4 qat; target.patch not needed)")
 print(f"deep_ep                 {md.version('deep_ep')} (deepep.py top-level Buffer hard dep)")
