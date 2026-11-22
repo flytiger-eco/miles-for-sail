@@ -306,25 +306,38 @@ RUN (git clone https://github.com/pytorch/torchtitan.git /root/torchtitan \
     cd / && python3 -c "import importlib.metadata as im; assert im.version('torchdata') == '0.11.0+v0.1.0.ppu2.2.0', im.version('torchdata'); assert im.version('spmd_types') == '0.2.3', im.version('spmd_types'); from torchtitan.distributed import ParallelDims; import tyro, torchdata; print('torchtitan backend deps OK')"
 
 # =====================================================================
-# Step 5: TransformerEngine + apex (same-generation platform builds)
+# Step 5: TransformerEngine + apex + kernel set (art-source platform
+#         builds; --no-deps / -c keeps torch and numpy untouched)
 # =====================================================================
+# Pin the ppu2.2.0 builds: index.json lists the torch-2.13/cu130/cp312
+# wheels under sdk {"2.2.0": {supported: ["2.2.1"]}} -- i.e. they were
+# built in the ppu2.2.0 generation and are declared supported on SDK 2.2.1
+# (this image's SDK). The ppu2.2.1 index generations carry no torch-2.13
+# wheel for these packages, and their downloader setup.py then sets
+# python_requires=">9.9" as an intentional no-match sentinel, so pip rejects
+# the install on any Python. Same-generation pinning matches the original
+# v0.1.2 official Dockerfile.ppu.
 
-RUN pip install -c /tmp/miles_constraints.txt "transformer-engine==2.16+v0.1.0.ppu2.2.1" && \
+# Official-image kernel set, platform builds (art-source prebuilt; --no-deps keeps
+# torch untouched). causal_conv1d has ONLY 1.7.0 (official 1.6.1; no 1.6.x
+# torch-2.13 platform build); with it importable, miles short_conv_backend()
+# auto-selects the fla "mix" backend for the GDN trainer conv.
+RUN pip install -c /tmp/miles_constraints.txt "transformer-engine==2.16+v0.1.0.ppu2.2.0" && \
     pip install -c /tmp/miles_constraints.txt einops onnx onnxscript pydantic nvdlfw-inspect && \
-    pip install -c /tmp/miles_constraints.txt "apex==24.4.1+v0.1.0.ppu2.2.1"
+    pip install -c /tmp/miles_constraints.txt "apex==24.4.1+v0.1.0.ppu2.2.0"
 
 # Official-image kernel set, platform builds (art-source prebuilt; --no-deps keeps
 # torch untouched). causal_conv1d has ONLY 1.7.0 (official 1.6.1; no 1.6.x
 # torch-2.13 platform build); with it importable, miles short_conv_backend()
 # auto-selects the fla "mix" backend for the GDN trainer conv.
 RUN pip install --no-deps --no-build-isolation \
-        "causal-conv1d==1.7.0+v0.1.0.ppu2.2.1" \
-        "mamba-ssm==2.3.1+v0.1.0.ppu2.2.1" \
-        "fast-hadamard-transform==1.1.0.post2+v0.1.0.ppu2.2.1" && \
+        "causal-conv1d==1.7.0+v0.1.0.ppu2.2.0" \
+        "mamba-ssm==2.3.1+v0.1.0.ppu2.2.0" \
+        "fast-hadamard-transform==1.1.0.post2+v0.1.0.ppu2.2.0" && \
     cd / && python3 -c "import importlib.metadata as im; \
-assert im.version('causal-conv1d') == '1.7.0+v0.1.0.ppu2.2.1', im.version('causal-conv1d'); \
-assert im.version('mamba-ssm') == '2.3.1+v0.1.0.ppu2.2.1', im.version('mamba-ssm'); \
-assert im.version('fast-hadamard-transform') == '1.1.0.post2+v0.1.0.ppu2.2.1', im.version('fast-hadamard-transform'); \
+assert im.version('causal-conv1d') == '1.7.0+v0.1.0.ppu2.2.0', im.version('causal-conv1d'); \
+assert im.version('mamba-ssm') == '2.3.1+v0.1.0.ppu2.2.0', im.version('mamba-ssm'); \
+assert im.version('fast-hadamard-transform') == '1.1.0.post2+v0.1.0.ppu2.2.0', im.version('fast-hadamard-transform'); \
 import torch, causal_conv1d_cuda, selective_scan_cuda, fast_hadamard_transform_cuda; \
 from causal_conv1d.cpp_functions import causal_conv1d_bwd_function; \
 import mamba_ssm, fast_hadamard_transform; print('causal_conv1d / mamba_ssm / fast_hadamard install check OK')"
@@ -442,7 +455,7 @@ RUN printf '%s\n' \
     "miles_branch=${MILES_BRANCH} (this repo's v0.1.2 branch COPY'd at build time + in-tree adaptations: colocate IPC barrier + GPU id sortkey)" \
     "sglang=0.5.21 (art-source prebuilt whl 0.5.21+v0.1.0.ppu2.2.1 sha256=dbf9fa16461e26045a58cc2033fb9369cf11b10ceba5f5a66976a04f0b368c0c; runtime-port merge patch 176 files (gen pin @${SAIL_PIN}) + EAGLE draft oc replay/restore + decode-graph recapture patch (2 files); applied on site-packages)" \
     "megatron=${MEGATRON_COMMIT} (radixark/Megatron-LM miles-main; editable; megatron-core 0.19.0)" \
-    "transformer_engine=2.16+v0.1.0.ppu2.2.1 apex=24.4.1+v0.1.0.ppu2.2.1 (int4_qat kernel bundled)" \
+    "transformer_engine=2.16+v0.1.0.ppu2.2.0 apex=24.4.1+v0.1.0.ppu2.2.0 (int4_qat kernel bundled; ppu2.2.0-generation wheels, supported on SDK 2.2.1)" \
     "flash-attn=2.8.2+v0.2.0.ppu2.2.1 + flash-attn-3 3.0.0+v0.2.0.ppu2.2.1 (TE dual-package form)" \
     "flash-linear-attention=0.5.2+4ce9e47.ppu2.2.0 fork (shell + fla-core split package) + KDA hoist patch" \
     "pla=1.0.0+v0.1.0.ppu2.2.0 (linear-attn kernels; sglang FLA-family rollout path)" \
@@ -458,7 +471,7 @@ RUN printf '%s\n' \
     "sglang-router=0.3.2 OFFICIAL (radixark/miles-wheels, 51-field GenerateRequest w/ return_routed_experts) + sgl-model-gateway 0.3.2 (/usr/local/bin); NOT the art-source build" \
     "fake_int4_quant_cuda=0.0.0 (official source miles int4_fake, platform nvcc build)" \
     "torchtitan=0.3.0 @086bf6c (editable --no-deps) spmd_types=0.2.3 tyro>=1.0.5 torchdata=0.11.0+v0.1.0.ppu2.2.0" \
-    "causal-conv1d=1.7.0+v0.1.0.ppu2.2.1 (only torch-2.13 build available; GDN short conv -> fla mix backend) mamba-ssm=2.3.1+v0.1.0.ppu2.2.1 fast-hadamard-transform=1.1.0.post2+v0.1.0.ppu2.2.1" \
+    "causal-conv1d=1.7.0+v0.1.0.ppu2.2.0 (only torch-2.13 build available; GDN short conv -> fla mix backend) mamba-ssm=2.3.1+v0.1.0.ppu2.2.0 fast-hadamard-transform=1.1.0.post2+v0.1.0.ppu2.2.0 (ppu2.2.0-generation wheels, supported on SDK 2.2.1)" \
     > /etc/miles-release
 
 # =====================================================================
@@ -609,9 +622,9 @@ from torchtitan.distributed import ParallelDims  # noqa: F401
 import spmd_types, tyro, torchdata  # noqa: F401,E401
 assert md.version("torchtitan") == "0.3.0", md.version("torchtitan")
 assert md.version("torchdata") == "0.11.0+v0.1.0.ppu2.2.0", md.version("torchdata")
-assert md.version("causal-conv1d") == "1.7.0+v0.1.0.ppu2.2.1", md.version("causal-conv1d")
-assert md.version("mamba-ssm") == "2.3.1+v0.1.0.ppu2.2.1", md.version("mamba-ssm")
-assert md.version("fast-hadamard-transform") == "1.1.0.post2+v0.1.0.ppu2.2.1", md.version("fast-hadamard-transform")
+assert md.version("causal-conv1d") == "1.7.0+v0.1.0.ppu2.2.0", md.version("causal-conv1d")
+assert md.version("mamba-ssm") == "2.3.1+v0.1.0.ppu2.2.0", md.version("mamba-ssm")
+assert md.version("fast-hadamard-transform") == "1.1.0.post2+v0.1.0.ppu2.2.0", md.version("fast-hadamard-transform")
 assert md.version("ml-dtypes") == "0.4.1", md.version("ml-dtypes")
 from miles_plugins.models.linear_attn import short_conv_backend
 assert short_conv_backend() == "mix", f"GDN short conv backend: {short_conv_backend()}"
