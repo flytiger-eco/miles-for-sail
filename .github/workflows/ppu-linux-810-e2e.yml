@@ -129,7 +129,7 @@ jobs:
 
   qwen35-e2e:
     name: ppu-e2e qwen3.5-35b training (810E 8 cards)
-    if: github.event_name == 'workflow_dispatch' && inputs.run_qwen35
+    if: github.event_name != 'workflow_dispatch' || inputs.run_qwen35
     runs-on: k8s-runner-group-cpu-flytiger
     container:
       image: ghcr.io/actions/actions-runner:latest
