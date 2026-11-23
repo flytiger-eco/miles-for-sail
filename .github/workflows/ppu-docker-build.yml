@@ -22,7 +22,7 @@ on:
         required: false
         default: ""
       image_tag:
-        description: "ghcr.io/<owner>/miles-for-sail:miles"
+        description: "ghcr.io/<owner>/miles-for-sail:miles-v0.1.2"
         required: false
         default: ""
       push:
@@ -75,10 +75,12 @@ jobs:
         id: meta
         run: |
           # default-upload policy: every triggering event uploads to GHCR.
-          # The rolling :miles tag is reserved for push (merge into a v*
-          # branch) and manual dispatch runs; PR builds only push immutable
-          # tags (sha / timestamp / pr-<number>) so downstream :miles
-          # consumers never see unreviewed PR content.
+          # The rolling tag is branch-scoped (GITHUB_REF_NAME on push and
+          # dispatch, e.g. :miles-v0.1.2) so each release line keeps its own
+          # pointer instead of every v* branch overwriting one shared :miles;
+          # PR builds only push immutable tags (sha / timestamp /
+          # pr-<number>) so rolling-tag consumers never see unreviewed PR
+          # content.
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             PUSH="${{ inputs.push }}"
           else
@@ -92,11 +94,13 @@ jobs:
             IMAGE_NAME="ghcr.io/${OWNER}/miles-for-sail"
             TIMESTAMP="$(TZ=Asia/Shanghai date +%Y%m%d-%H%M%S)"
             if [ "${{ github.event_name }}" = "pull_request" ]; then
-              # PR build: immutable tags only, rolling :miles untouched
+              # PR build: immutable tags only, branch rolling tag untouched
               IMAGE_TAG="${IMAGE_NAME}:miles-${GITHUB_SHA::7}"
               TAGS="${IMAGE_TAG}"$'\n'"${IMAGE_NAME}:miles-${TIMESTAMP}"$'\n'"${IMAGE_NAME}:pr-${{ github.event.pull_request.number }}"
             else
-              IMAGE_TAG="${IMAGE_NAME}:miles"
+              # push (merge into a v* branch) / dispatch: refresh this
+              # branch's own rolling pointer, e.g. :miles-v0.1.2
+              IMAGE_TAG="${IMAGE_NAME}:miles-${GITHUB_REF_NAME}"
               TAGS="${IMAGE_TAG}"$'\n'"${IMAGE_NAME}:miles-${TIMESTAMP}"$'\n'"${IMAGE_NAME}:miles-${GITHUB_SHA::7}"
             fi
           else

@@ -54,7 +54,7 @@ jobs:
       # ppu-docker-build.yml). The image build runs in parallel with this
       # workflow, so wait for it to complete and test the matching PR image;
       # pushes that did not rebuild (e.g. workflow-only changes) keep
-      # testing the rolling :miles. A workflow_run chain would be cleaner
+      # testing the branch rolling tag. A workflow_run chain would be cleaner
       # but only registers from the default branch, which does not carry
       # this workflow file.
       - name: Resolve test image (wait for the PR image build)
@@ -69,12 +69,15 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
         with:
           script: |
-            const rolling = 'ghcr.io/flytiger-eco/miles-for-sail:miles';
+            // branch-scoped rolling tag (matches the build workflow's
+            // GITHUB_REF_NAME scheme; this workflow lives on the v0.1.2
+            // line, so the fallback is :miles-v0.1.2)
+            const rolling = 'ghcr.io/flytiger-eco/miles-for-sail:miles-v0.1.2';
             const headSha = process.env.PR_HEAD_SHA;
             const prNum = process.env.PR_NUMBER;
             if (!headSha || !prNum) {
               core.setOutput('image', rolling);
-              core.info('non-PR event: testing the rolling :miles');
+              core.info('non-PR event: testing the rolling miles-v0.1.2');
               return;
             }
             // the build run registers on the PR head within seconds of the
@@ -95,7 +98,7 @@ jobs:
             }
             if (!build) {
               core.setOutput('image', rolling);
-              core.info('no image build for this push; testing the rolling :miles');
+              core.info('no image build for this push; testing the rolling miles-v0.1.2');
               return;
             }
             for (let i = 0; i < 120 && build.status !== 'completed'; i++) {
