@@ -42,11 +42,13 @@ ENV CURL_HOME=/etc/curl
 
 # pip dependency constraints (pyarrow 25.0.1: numpy 1.26.4 compat line;
 # ray 2.58.0 satisfies the v0.1.2 requirements pin >=2.56.0,<2.59.0;
-# ml-dtypes 0.4.1: last NumPy 1.x C-API build -- tilelang's resolver dep,
-# the 0.7.0+ wheels are NumPy 2 ABI and break under the numpy 1.26.4 pin)
+# ml-dtypes 0.5.4: NumPy 1.x line (numpy>=1.26.0, no upper bound) with the
+# float4_e2m1fn dtype that onnx's _mapping needs; the 0.7.0+ wheels are
+# NumPy 2 ABI and break under the numpy 1.26.4 pin, while pre-0.5 builds
+# lack float4 and break the onnx -> TE import chain)
 RUN printf '%s\n' \
     "numpy==1.26.4" \
-    "ml-dtypes==0.4.1" \
+    "ml-dtypes==0.5.4" \
     "transformers==5.12.1" \
     "torch==2.13.0" \
     "safetensors==0.8.0" \
@@ -468,7 +470,7 @@ RUN printf '%s\n' \
     "deep_ep=2.2.2+v0.1.0.ppu2.2.1 (deepep.py top-level Buffer hard dep)" \
     "nvidia-modelopt=0.47.0 (glm5 plugin import chain)" \
     "pyarrow=25.0.1 (numpy 1.26.4 compat line)" \
-    "ml-dtypes=0.4.1 (NumPy 1.x C-API line; tilelang resolver dep -- 0.7.0+ is NumPy 2 ABI)" \
+    "ml-dtypes=0.5.4 (NumPy 1.x line w/ float4 for onnx; tilelang resolver dep -- 0.7.0+ is NumPy 2 ABI, pre-0.5 lacks float4)" \
     "ray=2.58.0 torchft-nightly=2026.4.3 tilelang=0.1.8+v0.2.0.ppu2.2.0" \
     "sglang-router=0.3.2 OFFICIAL (radixark/miles-wheels, 51-field GenerateRequest w/ return_routed_experts) + sgl-model-gateway 0.3.2 (/usr/local/bin); NOT the art-source build" \
     "fake_int4_quant_cuda=0.0.0 (official source miles int4_fake, platform nvcc build)" \
@@ -627,7 +629,9 @@ assert md.version("torchdata") == "0.11.0+v0.1.0.ppu2.2.0", md.version("torchdat
 assert md.version("causal-conv1d") == "1.7.0+v0.1.0.ppu2.2.0", md.version("causal-conv1d")
 assert md.version("mamba-ssm") == "2.3.1+v0.1.0.ppu2.2.0", md.version("mamba-ssm")
 assert md.version("fast-hadamard-transform") == "1.1.0.post2+v0.1.0.ppu2.2.0", md.version("fast-hadamard-transform")
-assert md.version("ml-dtypes") == "0.4.1", md.version("ml-dtypes")
+assert md.version("ml-dtypes") == "0.5.4", md.version("ml-dtypes")
+import ml_dtypes as _mldt
+assert hasattr(_mldt, "float4_e2m1fn"), "ml-dtypes lacks float4_e2m1fn (onnx import chain)"
 from miles_plugins.models.linear_attn import short_conv_backend
 assert short_conv_backend() == "mix", f"GDN short conv backend: {short_conv_backend()}"
 
@@ -643,7 +647,7 @@ print(f"tile_kernels            {md.version('tile_kernels')} (DeepSeek-V4 qat; t
 print(f"deep_ep                 {md.version('deep_ep')} (deepep.py top-level Buffer hard dep)")
 print(f"nvidia-modelopt         {md.version('nvidia-modelopt')} (glm5 plugin import chain)")
 print(f"pyarrow                 {md.version('pyarrow')} (numpy 1.26.4 compat line)")
-print(f"ml_dtypes               {md.version('ml-dtypes')} (NumPy 1.x C-API line; tvm_ffi/tilelang import chain)")
+print(f"ml_dtypes               {md.version('ml-dtypes')} (NumPy 1.x line w/ float4; tvm_ffi/tilelang + onnx import chains)")
 print(f"torch_memory_saver      {md.version('torch_memory_saver')} (upstream b5588e83 source build)")
 print(f"sglang-kernel           {md.version('sglang-kernel')} (triton_kernels provider; matches the wheel metadata pin)")
 print(f"mbridge                 {md.version('mbridge')}")
