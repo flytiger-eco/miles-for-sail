@@ -102,6 +102,7 @@ jobs:
             bash <<'PPU_MILES_E2E'
             set -uo pipefail
             cd "${{ env.SOURCE_DIR }}"
+            export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
             # git in the pod sees the unpacked checkout as a foreign owner
             # ("dubious ownership", exit 128); tests that shell out to git
             # need this to pass.
