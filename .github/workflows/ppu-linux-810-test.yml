@@ -12,6 +12,7 @@ on:
       - '.github/scripts/ppu/**'
       - 'tests/**'
       - 'miles/**'
+      - 'docker/**'
   push:
     branches:
       - v*
@@ -20,6 +21,7 @@ on:
       - '.github/scripts/ppu/**'
       - 'tests/**'
       - 'miles/**'
+      - 'docker/**'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -30,7 +32,6 @@ permissions:
   actions: read
 
 env:
-  IMAGE: ghcr.io/flytiger-eco/miles-for-sail:miles
   NAMESPACE: ppu-sched
   HOST_VOLUMES: "/nas_aisw:/nas_aisw,/wl_nas:/mnt/wl_nas"
   SOURCE_DIR: /workspace/source
@@ -49,6 +50,65 @@ jobs:
     timeout-minutes: 420
 
     steps:
+      # Dockerfile PRs push immutable pr-<N> tags (default-upload policy in
+      # ppu-docker-build.yml). The image build runs in parallel with this
+      # workflow, so wait for it to complete and test the matching PR image;
+      # pushes that did not rebuild (e.g. workflow-only changes) keep
+      # testing the rolling :miles. A workflow_run chain would be cleaner
+      # but only registers from the default branch, which does not carry
+      # this workflow file.
+      - name: Resolve test image (wait for the PR image build)
+        id: image
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const rolling = 'ghcr.io/flytiger-eco/miles-for-sail:miles';
+            if (context.eventName !== 'pull_request') {
+              core.setOutput('image', rolling);
+              core.info(`${context.eventName}: testing the rolling :miles`);
+              return;
+            }
+            const pr = context.payload.pull_request;
+            // the build run registers on the PR head within seconds of the
+            // push when its paths match; grace window before deciding this
+            // push did not trigger a rebuild
+            let build = null;
+            for (let i = 0; i < 20 && !build; i++) {
+              const { data: { workflow_runs: runs } } =
+                await github.rest.actions.listWorkflowRunsForRepo({
+                  ...context.repo, head_sha: pr.head.sha,
+                  event: 'pull_request', per_page: 100,
+                });
+              build = runs.find(r => r.name === 'Build Miles Image') || null;
+              if (!build) {
+                core.info(`waiting for the image build to register (attempt ${i + 1}/20)`);
+                await new Promise(r => setTimeout(r, 30000));
+              }
+            }
+            if (!build) {
+              core.setOutput('image', rolling);
+              core.info('no image build for this push; testing the rolling :miles');
+              return;
+            }
+            for (let i = 0; i < 120 && build.status !== 'completed'; i++) {
+              core.info(`waiting for the image build (attempt ${i + 1}/120, status ${build.status})`);
+              await new Promise(r => setTimeout(r, 60000));
+              const { data: run } = await github.rest.actions.getWorkflowRun({
+                ...context.repo, run_id: build.id,
+              });
+              build = run;
+            }
+            if (build.status !== 'completed') {
+              core.setFailed('timed out waiting for the image build');
+              return;
+            }
+            if (build.conclusion === 'success') {
+              core.setOutput('image', `ghcr.io/flytiger-eco/miles-for-sail:pr-${pr.number}`);
+              core.info(`image build succeeded; testing pr-${pr.number}`);
+              return;
+            }
+            core.setFailed(`image build ended ${build.conclusion}; the PR image was not pushed, UT cannot run`);
+
       - name: Checkout miles-for-sail
         id: checkout
         continue-on-error: true
@@ -73,7 +133,7 @@ jobs:
           nproc_per_node: 4
           node_selector: ${{ env.NODE_SELECTOR }}
           host_volumes: ${{ env.HOST_VOLUMES }}
-          image: ${{ env.IMAGE }}
+          image: ${{ steps.image.outputs.image }}
           namespace: ${{ env.NAMESPACE }}
           source_dir: ${{ env.SOURCE_DIR }}
           timeout_minutes: 360
