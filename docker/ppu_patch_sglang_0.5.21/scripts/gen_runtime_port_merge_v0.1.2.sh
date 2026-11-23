@@ -2,63 +2,43 @@
 # Copyright © 2026 Zhejiang Runhe Cloud Intelligence Technology Co., Ltd
 
 # =============================================================================
-# gen_runtime_port_merge_v0.1.2.sh
-# miles-sail v0.1.2 runtime-port patch regeneration (fully automated and
-# self-contained; runs anywhere with git/python3 + public network access).
+# gen_runtime_port_merge_v012.sh -- fully automated regeneration of the
+# miles-sail v0.1.2 runtime-port patch (self-contained: needs only git,
+# python3 and public github access).
 #
-# Pipeline:
-#   Phase 1  fetch three refs from public github + topology assertion
-#   Phase 2  raw patch generation: git diff v0.5.21..sglang-miles(b84bec57) -- python/sglang/
-#   Phase 3  A' three-way merge: worktree @ sglang-for-sail v0.5.21 branch HEAD + merge b84bec57
-#   Phase 4  auto-resolve 13 conflict blocks (embedded resolve_conflicts, strategy: keep both sides)
-#   Phase 5  merge commit + merge tree hash assertion (MERGE_TREE_EXPECT, decisive)
-#   Phase 6  merge patch export: git diff <sglang-for-sail HEAD>..HEAD -- python/sglang/
-#   Phase 7  apply-check on a clean sglang-for-sail baseline (skip with APPLY_CHECK=0)
-#
-# Inputs:
-#   base   = sglang v0.5.21 tag        e00930c5489053f26d86b179cee0d087f846acbb
-#   theirs = sglang-miles branch        b84bec5761a6cdc8b1df86b9b89ead80a7a9bb02
-#   ours   = flytiger-eco/sglang-for-sail v0.5.21 branch HEAD (taken dynamically,
-#            not pinned to a commit; the merge-base must still be the v0.5.21 tag, else fail loudly)
-#
-# Prerequisites:
-#   - github.com reachable (sgl-project/sglang and flytiger-eco/sglang-for-sail,
-#     https needs no credentials; set GH_PROXY behind a MITM proxy)
-#   - git >= 2.30
-#
-# Environment variables (optional):
-#   WORKDIR     working directory (default /tmp/portmerge-v0.1.2-gen; holds the clone and the worktree)
-#   OUT_DIR     patch output directory (default <script dir>/../patches)
-#   REF_DIR     reference directory: byte-wise cmp against same-named patches when present (default empty = skip)
-#   GH_PROXY    http proxy URL (e.g. http://host:port; default empty = direct connection)
-#   MERGE_TREE_EXPECT  expected merge tree hash (empty = probe mode, only print the actual value)
-#   APPLY_CHECK 1 = run git apply --check on a clean baseline (default 1)
-#   CLEANUP    1 = delete WORKDIR at the end (merge clone + worktree, ~1GB; used by
-#              docker build layers to avoid bulky leftovers in intermediate layers)
-#
-# Outputs:
-#   $OUT_DIR/sglang-0001-miles-v0.1.2-runtime-port.patch         (raw, +8536/-1902)
-#   $OUT_DIR/sglang-0001-miles-v0.1.2-runtime-port-ppu-merge.patch (merge, changes as the sglang-for-sail
-#            baseline advances; stat printed by the script and asserted via MERGE_STAT_EXPECT)
+# Phases: 1 fetch three refs + topology asserts  2 raw patch (v0.5.21..miles)
+#   3 three-way merge on sglang-for-sail tag 0.5.21+v0.1.0  4 resolve the 13
+#   conflict blocks  5 merge-tree hash assert  6 export the merge patch
+#   7 apply-check on the clean baseline
+# Refs: base = sglang v0.5.21 e00930c5 / theirs = sglang-miles b84bec57 /
+#   ours = sglang-for-sail tag 0.5.21+v0.1.0 @ 9bb44378 (versioned release pin)
+# Env (optional): WORKDIR / OUT_DIR / REF_DIR / GH_PROXY (git fetch/clone proxy)
+#   MERGE_TREE_EXPECT (empty = probe mode) / APPLY_CHECK (default 1) /
+#   CLEANUP (default 0; set to 1 in the docker build layer)
+# Outputs: $OUT_DIR/sglang-0001-miles-v0.1.2-runtime-port.patch (raw)
+#          $OUT_DIR/sglang-0001-miles-v0.1.2-runtime-port-ppu-merge.patch
 # =============================================================================
 set -euo pipefail
 
-# ---------- pinned refs (v0.1.2 specific; equivalent release-lock + merge tree d457c50b) ----------
+# ---------- pinned refs (v0.1.2, equivalent of release-lock + merge tree d457c50b) ----------
 V521_COMMIT=e00930c5489053f26d86b179cee0d087f846acbb
 MILES_COMMIT=b84bec5761a6cdc8b1df86b9b89ead80a7a9bb02
 UPSTREAM_REPO=https://github.com/sgl-project/sglang.git
 SAIL_REPO=https://github.com/flytiger-eco/sglang-for-sail.git
-SAIL_BRANCH=v0.5.21
+# ours = the versioned release tag (naming: <sglang ver>+<port ver>): the
+# v0.5.21 branch HEAD keeps moving, which changes the merge tree and forces a
+# manual conflict re-review, so the tag is pinned as the stable release point.
+SAIL_TAG=0.5.21+v0.1.0
+SAIL_TAG_COMMIT=9bb44378927e89ec1c4fff3824e0eb31acd7f8d5
 MERGE_BRANCH=port/sglang-miles-v0.5.21-v0.1.2
-# Decisive merge tree assertion (d457c50b successor: measured on the sglang-for-sail v0.5.21 @de80b4a5 baseline).
-# Once the sglang-for-sail branch advances this value must change -- fail loudly, re-run the conflict review and update the pin.
-MERGE_TREE_EXPECT=${MERGE_TREE_EXPECT:-7953d49e8c4930335cb5b0c79649f9a0f865ac48}
+# decisive merge-tree assert (measured on tag 0.5.21+v0.1.0 @ 9bb44378; the
+# value must change when the ours baseline moves).
+MERGE_TREE_EXPECT=${MERGE_TREE_EXPECT:-bf73b2474cac6a86c602eddc44e1ff67d18deac0}
 MERGE_STAT_EXPECT=${MERGE_STAT_EXPECT:-176 files changed, 8550 insertions(+), 1904 deletions(-)}
 MERGE_FILES_EXPECT=${MERGE_FILES_EXPECT:-176}
 
-# Fetch depth: sglang-for-sail v0.5.21 is 141+ commits past the tag and miles is 37
-# commits past it; the depth must cover all of them, otherwise the shallow cut leaves an
-# empty merge-base (shallow-fetch artifact lesson).
+# fetch depth must cover every commit ahead of the v0.5.21 tag (174 for
+# sglang-for-sail, 37 for miles), else a shallow cut empties merge-base.
 MILES_FETCH_DEPTH=60
 SAIL_FETCH_DEPTH=250
 
@@ -66,13 +46,13 @@ RAW_NAME=sglang-0001-miles-v0.1.2-runtime-port.patch
 MERGE_NAME=sglang-0001-miles-v0.1.2-runtime-port-ppu-merge.patch
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
-WORKDIR=${WORKDIR:-/tmp/portmerge-v0.1.2-gen}
+WORKDIR=${WORKDIR:-/tmp/portmerge-v012-gen}
 OUT_DIR=${OUT_DIR:-$SCRIPT_DIR/../patches}
 REF_DIR=${REF_DIR:-}
 APPLY_CHECK=${APPLY_CHECK:-1}
 CLEANUP=${CLEANUP:-0}
 
-# Public https: routed through GH_PROXY behind a MITM proxy (git fetch/clone only)
+# public https: under MITM proxies inject it via GH_PROXY (git fetch/clone only)
 if [ -n "${GH_PROXY:-}" ]; then
     GIT_NET=(git -c "http.proxy=$GH_PROXY" -c http.sslVerify=false)
 else
@@ -90,19 +70,18 @@ fetch_retry() {
 }
 
 mkdir -p "$OUT_DIR"
-echo "== gen_runtime_port_merge_v0.1.2 =="
+echo "== gen_runtime_port_merge_v012 =="
 echo "   WORKDIR=$WORKDIR  OUT_DIR=$OUT_DIR  REF_DIR=${REF_DIR:-<none>}"
 
 # ============================================================================
-# Phase 1: fresh clone + fetch three refs + topology assertion
+# Phase 1: fresh clone + three-ref fetch + topology asserts
 # ============================================================================
 REPO=$WORKDIR/sglang.git
 rm -rf "$WORKDIR"
 mkdir -p "$WORKDIR"
 
-# The clone gets its own retry loop (not fetch_retry): a GnuTLS hiccup can leave a
-# half-cloned directory behind; remove it before each retry, or the next clone dies
-# instantly with "destination path already exists"
+# clone gets its own retry loop (not fetch_retry): a GnuTLS drop can leave a
+# half-cloned dir behind; clear it before each retry or the next clone fails.
 CLONE_OK=0
 for _i in 1 2 3; do
     rm -rf "$REPO"
@@ -118,23 +97,25 @@ fetch_retry "fetch miles SHA (depth $MILES_FETCH_DEPTH)" \
     "${GIT_NET[@]}" fetch --depth "$MILES_FETCH_DEPTH" origin "$MILES_COMMIT"
 fetch_retry "fetch v0.5.21 tag" \
     "${GIT_NET[@]}" fetch --depth 1 origin tag v0.5.21
-fetch_retry "fetch sglang-for-sail $SAIL_BRANCH (depth $SAIL_FETCH_DEPTH)" \
-    "${GIT_NET[@]}" fetch --depth "$SAIL_FETCH_DEPTH" sglang-for-sail "$SAIL_BRANCH"
+fetch_retry "fetch sglang-for-sail tag $SAIL_TAG (depth $SAIL_FETCH_DEPTH)" \
+    "${GIT_NET[@]}" fetch --depth "$SAIL_FETCH_DEPTH" sglang-for-sail "tag" "$SAIL_TAG"
 
 V=$(git rev-parse "v0.5.21^{commit}")
 [ "$V" = "$V521_COMMIT" ] || die "v0.5.21 tag moved: $V != $V521_COMMIT"
 git cat-file -e "$MILES_COMMIT^{commit}" || die "miles commit $MILES_COMMIT not fetched"
-# Optional pin: when SAIL_COMMIT is set, force the specified sglang-for-sail commit
-# (reproduce the verified baseline; a branch HEAD advance no longer affects the
-# build); if the pin is outside the fetched depth, fail and suggest raising SAIL_FETCH_DEPTH.
-if [ -n "${SAIL_COMMIT:-}" ]; then
+# ours defaults to the versioned release tag (tag moves are caught by the
+# rev-parse assert above); SAIL_COMMIT is an explicit override that must be
+# reachable in the fetched history (the Dockerfile passes SAIL_PIN too).
+OURS_COMMIT=$(git rev-parse "${SAIL_TAG}^{commit}")
+[ "$OURS_COMMIT" = "$SAIL_TAG_COMMIT" ] \
+    || die "sglang-for-sail tag $SAIL_TAG moved: $OURS_COMMIT != $SAIL_TAG_COMMIT (retag detected -- review & re-pin)"
+if [ -n "${SAIL_COMMIT:-}" ] && [ "$SAIL_COMMIT" != "$OURS_COMMIT" ]; then
     git cat-file -e "${SAIL_COMMIT}^{commit}" 2>/dev/null \
         || die "sglang-for-sail pin commit $SAIL_COMMIT not in fetched history (raise SAIL_FETCH_DEPTH)"
     OURS_COMMIT="$SAIL_COMMIT"
-    echo "   ours = sglang-for-sail PINNED @ $OURS_COMMIT (branch HEAD $(git rev-parse --short "sglang-for-sail/$SAIL_BRANCH") ignored)"
+    echo "   ours = sglang-for-sail OVERRIDE @ $OURS_COMMIT (tag $SAIL_TAG ignored)"
 else
-    OURS_COMMIT=$(git rev-parse "sglang-for-sail/$SAIL_BRANCH")
-    echo "   ours = sglang-for-sail $SAIL_BRANCH HEAD @ $OURS_COMMIT"
+    echo "   ours = sglang-for-sail tag $SAIL_TAG @ $OURS_COMMIT (versioned release pin)"
 fi
 
 MB=$(git merge-base "$OURS_COMMIT" "$MILES_COMMIT" || true)
@@ -142,7 +123,7 @@ MB=$(git merge-base "$OURS_COMMIT" "$MILES_COMMIT" || true)
 echo "   topology OK: base=$MB miles=+$(git rev-list --count $V521_COMMIT..$MILES_COMMIT) sglang-for-sail=+$(git rev-list --count $V521_COMMIT..$OURS_COMMIT)"
 
 # ============================================================================
-# Phase 2: raw patch generation (git diff v0.5.21..b84bec57 -- python/sglang/)
+# Phase 2: raw patch (git diff v0.5.21..b84bec57 -- python/sglang/)
 # ============================================================================
 RAW_OUT=$OUT_DIR/$RAW_NAME
 git diff "$V521_COMMIT" "$MILES_COMMIT" -- python/sglang/ > "$RAW_OUT"
@@ -160,25 +141,23 @@ if [ -n "$REF_DIR" ] && [ -f "$REF_DIR/$RAW_NAME" ]; then
 fi
 
 # ============================================================================
-# Phase 3: A' three-way merge (worktree @ sglang-for-sail v0.5.21 baseline + merge miles)
+# Phase 3: three-way merge (worktree @ sglang-for-sail v0.5.21 baseline + merge miles)
 # ============================================================================
 WT=$WORKDIR/portmerge-wt
 git worktree prune 2>/dev/null || true
 git worktree add --detach "$WT" "$OURS_COMMIT" >/dev/null
 cd "$WT"
 
-# The committer identity must be configured BEFORE the merge (repo-local; the
-# worktree shares the main repo config): git merge --no-commit still prepares
-# the merge commit and fatals with exit 128 without an identity.
+# committer identity must be configured before MERGE (repo-local; the worktree
+# shares the main repo config); git merge --no-commit still prepares the merge
+# commit and dies with exit 128 without an identity.
 git config user.name "miles-sail-build"
 git config user.email "miles-sail-build@users.noreply.github.com"
 
 git checkout -q -b "$MERGE_BRANCH"
 
-# Merge exit-code classification: 1 = conflict (expected); 0/anything else =
-# unexpected (0 is caught by the conflict-set assertion below; other codes are
-# usually environment fatals -- the original `|| true` silently swallowed them;
-# fail explicitly instead)
+# merge exit codes: 1 = conflict (expected); 0/other = unexpected (0 is caught
+# by the conflict-set assert below; others are env fatals -- fail loudly).
 set +e
 git merge --no-commit --no-ff "$MILES_COMMIT" >/dev/null 2>&1
 MERGE_RC=$?
@@ -205,34 +184,19 @@ fi
 echo "   merge conflicts: $CONFLICT_COUNT files / 13 blocks (as expected)"
 
 # ============================================================================
-# Phase 4: auto-resolve 13 conflict blocks (embedded resolver; per file, in block order; keep both sides)
+# Phase 4: conflict resolution (embedded resolver, per-file block replacement, keep both sides)
 # ============================================================================
-cat > "$WORKDIR/resolve_conflicts_v0.1.2.py" <<'PYEOF'
+cat > "$WORKDIR/resolve_conflicts_v012.py" <<'PYEOF'
 #!/usr/bin/env python3
-"""v0.1.2 A' three-way merge conflict resolution (13 blocks, strategy: keep both sides).
-
-ours  = sglang-for-sail (flytiger-eco/sglang-for-sail) v0.5.21 branch HEAD (dynamic)
-theirs= sglang-miles b84bec57 (v0.5.21 + 37 commits)
-
-Fusion principles:
-- keep every sglang-for-sail feature: NaN-GUARD, NVTX profiling, CP prefill,
-  PR#19148 set_index_k_scale_buffer, deepgemm mxfp4 scale,
-  kimi dtype guard, packed_modules_mapping, dsv4 bf16 topk routing,
-  deepseek_nextn DSA CP prefill init
-- keep every miles feature: capture/raw_result dual-return protocol, tp_invariant row
-  linear, graph_num_tokens, mxfp4 in-place reload (reuse_parameter_storage
-  + runtime_specs validation), _bfa_w buffer reuse, get_lora_target_module_name,
-  init_unified_loader_mappings
-- protocol adaptation points: the CP-branch return becomes _capture_and_return(topk, None);
-  the dsv4 bf16 early-return switches to the (result, raw_indices) protocol
-
-(Embedded deployment form: ROOT is injected from the PORTMERGE_ROOT env var;
- everything else is byte-identical to scripts/resolve_conflicts.py.)
-"""
+"""Resolve the 13 conflict blocks of the v0.1.2 three-way merge (keep both
+sides). ours = sglang-for-sail tag 0.5.21+v0.1.0 @ 9bb44378 (release pin),
+theirs = sglang-miles b84bec57 (v0.5.21 + 37 commits). Embedded deployment:
+ROOT comes from the PORTMERGE_ROOT env var; otherwise identical to the
+standalone resolver."""
 import os
 import sys
 
-ROOT = os.environ.get("PORTMERGE_ROOT", "/tmp/portmerge-v0.1.2/python/sglang")
+ROOT = os.environ.get("PORTMERGE_ROOT", "/tmp/portmerge-v012/python/sglang")
 
 
 def resolve(path, solutions):
@@ -616,10 +580,10 @@ if __name__ == "__main__":
     main()
 PYEOF
 
-PORTMERGE_ROOT=$WT/python/sglang python3 "$WORKDIR/resolve_conflicts_v0.1.2.py"
+PORTMERGE_ROOT=$WT/python/sglang python3 "$WORKDIR/resolve_conflicts_v012.py"
 
-# Syntax-check the 8 files (same ast.parse all-green requirement as the offline flow)
-SAIL_BRANCH_REF="sglang-for-sail/$SAIL_BRANCH" python3 - <<'PYAST'
+# syntax check of the 8 files (ast.parse all green, as in the OP-06 flow)
+SAIL_OURS_REF="$SAIL_TAG" python3 - <<'PYAST'
 import ast, os, subprocess
 base = "python/sglang/"
 files = [
@@ -632,17 +596,16 @@ files = [
     "srt/layers/quantization/mxfp4.py",
     "srt/models/kimi_k3.py",
 ]
-ref = os.environ["SAIL_BRANCH_REF"]
+ref = os.environ["SAIL_OURS_REF"]
 ok, skip = 0, 0
 for f in files:
     try:
         ast.parse(open(base + f).read())
         ok += 1
     except SyntaxError:
-        # The local python may be older than the source syntax (e.g. 3.12
-        # nested-quote f-strings): if the ours original also fails to parse
-        # it is a pre-existing environment limitation (skip); a failure where
-        # the original parses fine is a merge-introduced syntax break (die).
+        # The local python may predate the source syntax (e.g. 3.12 nested
+        # f-string quotes): if the ours original also fails to parse it is a
+        # pre-existing env limitation (skip); merge-introduced breaks die.
         orig = subprocess.run(["git", "show", f"{ref}:{base}{f}"],
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                               universal_newlines=True)
@@ -657,11 +620,11 @@ print(f"AST-OK: {ok} files parsed, {skip} skipped (env limitation)")
 PYAST
 
 # ============================================================================
-# Phase 5: merge commit + decisive tree hash assertion
+# Phase 5: merge commit + decisive tree hash assert
 # ============================================================================
-# (committer identity was already configured before the merge in Phase 3)
+# (committer identity was configured before the Phase 3 merge)
 git add -A
-git commit -q -m "Merge sglang-miles b84bec57 (v0.1.2 runtime-port) into sglang-for-sail v0.5.21"
+git commit -q -m "Merge sglang-miles b84bec57 (v0.1.2 runtime-port) into sglang-for-sail 0.5.21+v0.1.0"
 
 TREE=$(git rev-parse "HEAD^{tree}")
 if [ -n "$MERGE_TREE_EXPECT" ]; then
@@ -697,7 +660,7 @@ if [ -n "$REF_DIR" ] && [ -f "$REF_DIR/$MERGE_NAME" ]; then
 fi
 
 # ============================================================================
-# Phase 7: apply-check on a clean baseline
+# Phase 7: apply-check on the clean platform baseline
 # ============================================================================
 if [ "$APPLY_CHECK" = "1" ]; then
     WT_CHECK=$WORKDIR/applycheck-wt
@@ -705,7 +668,7 @@ if [ "$APPLY_CHECK" = "1" ]; then
     git worktree prune
     git worktree add --detach "$WT_CHECK" "$OURS_COMMIT" >/dev/null
     git -C "$WT_CHECK" apply --check "$MERGE_OUT" \
-        && echo "   apply-check: PASS (clean apply to sglang-for-sail $SAIL_BRANCH @ $OURS_COMMIT)" \
+        && echo "   apply-check: PASS (clean apply to sglang-for-sail $SAIL_TAG @ $OURS_COMMIT)" \
         || die "apply-check FAILED on clean sglang-for-sail baseline"
     git worktree remove --force "$WT_CHECK"
     git worktree prune
