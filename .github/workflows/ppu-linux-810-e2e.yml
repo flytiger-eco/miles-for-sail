@@ -49,7 +49,10 @@ permissions:
   actions: read
 
 env:
-  IMAGE: ghcr.io/flytiger-eco/miles-for-sail:miles
+  # branch-scoped rolling tag: refreshed only on reviewed merges into
+  # v0.1.2 (matches the build workflow's GITHUB_REF_NAME scheme), not the
+  # cross-branch shared :miles pointer.
+  IMAGE: ghcr.io/flytiger-eco/miles-for-sail:miles-v0.1.2
   NAMESPACE: ppu-sched
   HOST_VOLUMES: "/nas_aisw:/nas_aisw,/wl_nas:/mnt/wl_nas"
   SOURCE_DIR: /workspace/source
