@@ -117,8 +117,9 @@ jobs:
                  python3 tests/e2e/short/test_qwen2.5_0.5B_gsm8k_short.py; then
                 rc=0
                 break
+              else
+                rc=$?
               fi
-              rc=$?
               echo "[ppu-miles-e2e] attempt ${attempt} failed (exit=${rc}); retrying after a pause"
               sleep 30
             done
