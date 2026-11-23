@@ -218,8 +218,14 @@ RUN pip install -c /tmp/miles_constraints.txt \
     "tqdm" "uvicorn" "uvloop" "watchfiles" "xgrammar==0.2.1" "xxhash" \
     "zstandard"
 
-RUN pip install --no-cache-dir tinker==0.26.2 typed-argument-parser && \
-    python3 -c "import tinker; import tap; print('tinker/tap install check OK')"
+# uv must exist at image runtime, not just build time: CI dependency
+# reconciliation (tests/ci/reconcile_dependencies.py) switches to
+# `uv pip install --overrides` whenever the image carries a cuDNN runtime
+# (nvidia-cudnn-cu12 arrives via the torch PPU wheel), so the binary has to
+# stay on PATH or every cudnn-pinned CI install plan dies with FileNotFoundError.
+RUN pip install --no-cache-dir tinker==0.26.2 typed-argument-parser uv && \
+    python3 -c "import tinker; import tap; print('tinker/tap install check OK')" && \
+    uv --version
 
 # sglang build check (imports only; no GPU device assumption at build time).
 # The art-source wheel ships the rust extensions prebuilt (.so), so the
