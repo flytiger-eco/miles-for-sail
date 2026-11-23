@@ -50,11 +50,11 @@ jobs:
     timeout-minutes: 420
 
     steps:
-      # Dockerfile PRs push immutable pr-<N> tags (default-upload policy in
+      # Dockerfile PRs push immutable per-push tags (default-upload policy in
       # ppu-docker-build.yml). The image build runs in parallel with this
       # workflow, so wait for it to complete and test the matching PR image;
-      # pushes that did not rebuild (e.g. workflow-only changes) keep
-      # testing the branch rolling tag. A workflow_run chain would be cleaner
+      # pushes that did not rebuild (e.g. workflow-only changes) fall back to
+      # the latest built PR image. A workflow_run chain would be cleaner
       # but only registers from the default branch, which does not carry
       # this workflow file.
       - name: Resolve test image (wait for the PR image build)
@@ -66,20 +66,29 @@ jobs:
           # unavailable; pass the PR context through step env, which is
           # evaluated on the runner side before the container starts
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         with:
           script: |
+            const repo = 'ghcr.io/flytiger-eco/miles-for-sail';
             // branch-scoped rolling tag (matches the build workflow's
             // GITHUB_REF_NAME scheme; this workflow lives on the v0.1.2
             // line, so the fallback is :miles-v0.1.2)
-            const rolling = 'ghcr.io/flytiger-eco/miles-for-sail:miles-v0.1.2';
+            const rolling = `${repo}:miles-v0.1.2`;
             const headSha = process.env.PR_HEAD_SHA;
+            const headRef = process.env.PR_HEAD_REF;
             const prNum = process.env.PR_NUMBER;
             if (!headSha || !prNum) {
               core.setOutput('image', rolling);
               core.info('non-PR event: testing the rolling miles-v0.1.2');
               return;
             }
+            // the cluster-task pod pins imagePullPolicy: IfNotPresent, so a
+            // mutable tag (pr-<n>) can be served stale from a node's local
+            // image store after an earlier round already pulled that tag;
+            // reference the per-push immutable tag (pr-<n>-<headsha>)
+            // instead, which always resolves to the exact fresh build
+            const tagFor = sha => `${repo}:pr-${prNum}-${sha.slice(0, 7)}`;
             // the build run registers on the PR head within seconds of the
             // push when its paths match; grace window before deciding this
             // push did not trigger a rebuild
@@ -97,6 +106,21 @@ jobs:
               }
             }
             if (!build) {
+              // this push did not rebuild the image; fall back to the
+              // immutable tag of the latest successful build for this PR
+              // branch, whose environment is still the one to test against
+              const { data: { workflow_runs: runs } } =
+                await github.rest.actions.listWorkflowRunsForRepo({
+                  ...context.repo, branch: headRef, event: 'pull_request',
+                  status: 'completed', per_page: 100,
+                });
+              const latest =
+                runs.find(r => r.name === 'Build Miles Image' && r.conclusion === 'success') || null;
+              if (latest) {
+                core.setOutput('image', tagFor(latest.head_sha));
+                core.info(`no image build for this push; testing ${tagFor(latest.head_sha)}`);
+                return;
+              }
               core.setOutput('image', rolling);
               core.info('no image build for this push; testing the rolling miles-v0.1.2');
               return;
@@ -114,8 +138,8 @@ jobs:
               return;
             }
             if (build.conclusion === 'success') {
-              core.setOutput('image', `ghcr.io/flytiger-eco/miles-for-sail:pr-${prNum}`);
-              core.info(`image build succeeded; testing pr-${prNum}`);
+              core.setOutput('image', tagFor(headSha));
+              core.info(`image build succeeded; testing ${tagFor(headSha)}`);
               return;
             }
             core.setFailed(`image build ended ${build.conclusion}; the PR image was not pushed, UT cannot run`);

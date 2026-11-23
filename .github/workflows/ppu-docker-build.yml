@@ -94,9 +94,14 @@ jobs:
             IMAGE_NAME="ghcr.io/${OWNER}/miles-for-sail"
             TIMESTAMP="$(TZ=Asia/Shanghai date +%Y%m%d-%H%M%S)"
             if [ "${{ github.event_name }}" = "pull_request" ]; then
-              # PR build: immutable tags only, branch rolling tag untouched
+              # PR build: immutable tags only, branch rolling tag untouched.
+              # pr-<num>-<headsha> is unique per push: the 810 cluster-task
+              # pod pins imagePullPolicy: IfNotPresent, so a mutable tag
+              # (pr-<num>) can be served stale from a node's local image
+              # store after an earlier round already pulled that tag.
+              PR_HEAD_SHA="${{ github.event.pull_request.head.sha }}"
               IMAGE_TAG="${IMAGE_NAME}:miles-${GITHUB_SHA::7}"
-              TAGS="${IMAGE_TAG}"$'\n'"${IMAGE_NAME}:miles-${TIMESTAMP}"$'\n'"${IMAGE_NAME}:pr-${{ github.event.pull_request.number }}"
+              TAGS="${IMAGE_TAG}"$'\n'"${IMAGE_NAME}:miles-${TIMESTAMP}"$'\n'"${IMAGE_NAME}:pr-${{ github.event.pull_request.number }}"$'\n'"${IMAGE_NAME}:pr-${{ github.event.pull_request.number }}-${PR_HEAD_SHA::7}"
             else
               # push (merge into a v* branch) / dispatch: refresh this
               # branch's own rolling pointer, e.g. :miles-v0.1.2
