@@ -610,6 +610,7 @@ assert _barrier_calls, "miles: dist.barrier(group=self._ipc_gather_group) not fo
 # back (miles requirements.txt carries sglang-router>=0.2.3) -- its 35-field
 # GenerateRequest silently drops return_routed_experts
 import glob
+import os
 import sglang_router
 assert md.version("sglang-router") == "0.3.2", f"sglang-router not the official build: {md.version('sglang-router')}"
 _rso = glob.glob(os.path.join(os.path.dirname(sglang_router.__file__), "*.so"))
