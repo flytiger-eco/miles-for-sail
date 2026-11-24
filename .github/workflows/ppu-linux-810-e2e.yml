@@ -197,13 +197,36 @@ jobs:
               --mode "${Q35_MODE}"
               --extra-env-vars "{\"no_proxy\":\"127.0.0.1,localhost,${POD_IP}\",\"NO_PROXY\":\"127.0.0.1,localhost,${POD_IP}\"}"
             )
-            if [[ -n "${Q35_EXTRA_ARGS}" ]]; then
-              args+=(--extra-args "${Q35_EXTRA_ARGS}")
+            # Align the AIME eval prompts to the training prompt template before
+            # eval. The recipe's prepare() downloads the raw datasets and its
+            # eval_args points at the unaligned aime-2024.jsonl. Pre-download the
+            # same datasets, wrap each AIME prompt with the template extracted
+            # from dapo-math-17k, then override --eval-prompt-data through
+            # extra_args (appended last by the recipe, so argparse last-wins).
+            # The aligned file has a distinct name, so prepare()'s re-download
+            # (cheap via the hf cache) leaves it intact.
+            DATA_DIR=/root/datasets
+            mkdir -p "${DATA_DIR}"
+            hf download --repo-type dataset zhuzilin/dapo-math-17k --local-dir "${DATA_DIR}/dapo-math-17k"
+            hf download --repo-type dataset zhuzilin/aime-2024 --local-dir "${DATA_DIR}/aime-2024"
+            AIME_ALIGNED="${DATA_DIR}/aime-2024/aime-2024-aligned.jsonl"
+            python3 scripts/tools/align_aime_prompt.py \
+              --train "${DATA_DIR}/dapo-math-17k/dapo-math-17k.jsonl" \
+              --test "${DATA_DIR}/aime-2024/aime-2024.jsonl" \
+              --out "${AIME_ALIGNED}"
+            if [[ ! -f "${AIME_ALIGNED}" ]]; then
+              echo "[ppu-miles-e2e] AIME alignment failed: ${AIME_ALIGNED} not produced" >&2
+              exit 1
             fi
-            # PPU development driver (0.0.0-000000 on 810E06) rejects async
-            # H2D copies on non-default CUDA streams created by the hybrid
-            # optimizer's overlap mode.  Drop the flag so D2H/H2D uses the
-            # default stream (blocking semantics) instead.
+            # Short verification horizon: cap rollout steps at 5. extra_args is
+            # appended last by the recipe, so this overrides the normal-mode
+            # --num-rollout 3000 (argparse last-wins). Q35_EXTRA_ARGS still passes
+            # through and can override further.
+            args+=(--extra-args "--num-rollout 5 --eval-prompt-data aime ${AIME_ALIGNED} ${Q35_EXTRA_ARGS}")
+            # The platform development driver rejects async H2D copies on
+            # non-default CUDA streams created by the hybrid optimizer's
+            # overlap mode.  Drop the flag so D2H/H2D uses the default
+            # stream (blocking semantics) instead.
             sed -i '/--overlap-cpu-optimizer-d2h-h2d/d' scripts/run_qwen3_5_35b_a3b_mtp.py
             echo "[ppu-miles-e2e] launching training with: ${args[*]}"
             python3 scripts/run_qwen3_5_35b_a3b_mtp.py "${args[@]}"
