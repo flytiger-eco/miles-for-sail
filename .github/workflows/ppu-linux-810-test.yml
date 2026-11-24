@@ -1,0 +1,194 @@
+# Copyright © 2026 Zhejiang Runhe Cloud Intelligence Technology Co., Ltd
+
+name: ppu-linux-810-test
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - v*
+    paths:
+      - '.github/workflows/ppu-linux-810-test.yml'
+      - '.github/scripts/ppu/**'
+      - 'tests/**'
+      - 'miles/**'
+      - 'docker/**'
+  push:
+    branches:
+      - v*
+    paths:
+      - '.github/workflows/ppu-linux-810-test.yml'
+      - '.github/scripts/ppu/**'
+      - 'tests/**'
+      - 'miles/**'
+      - 'docker/**'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  NAMESPACE: ppu-sched
+  HOST_VOLUMES: "/nas_aisw:/nas_aisw,/wl_nas:/mnt/wl_nas"
+  SOURCE_DIR: /workspace/source
+  NODE_SELECTOR: "board-type=OAM-810E"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  test:
+    name: ppu-test (810E 4 cards)
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 420
+
+    steps:
+      # Dockerfile PRs push immutable per-push tags (default-upload policy in
+      # ppu-docker-build.yml). The image build runs in parallel with this
+      # workflow, so wait for it to complete and test the matching PR image;
+      # pushes that did not rebuild (e.g. workflow-only changes) fall back to
+      # the latest built PR image. A workflow_run chain would be cleaner
+      # but only registers from the default branch, which does not carry
+      # this workflow file.
+      - name: Resolve test image (wait for the PR image build)
+        id: image
+        uses: actions/github-script@v7
+        env:
+          # the runner's custom container does not mount the workflow event
+          # file (GITHUB_EVENT_PATH is absent), so context.payload is
+          # unavailable; pass the PR context through step env, which is
+          # evaluated on the runner side before the container starts
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        with:
+          script: |
+            const repo = 'ghcr.io/flytiger-eco/miles-for-sail';
+            // branch-scoped rolling tag (matches the build workflow's
+            // GITHUB_REF_NAME scheme; this workflow lives on the v0.1.3
+            // line, so the fallback is :miles-v0.1.3)
+            const rolling = `${repo}:miles-v0.1.3`;
+            const headSha = process.env.PR_HEAD_SHA;
+            const headRef = process.env.PR_HEAD_REF;
+            const prNum = process.env.PR_NUMBER;
+            if (!headSha || !prNum) {
+              core.setOutput('image', rolling);
+              core.info('non-PR event: testing the rolling miles-v0.1.3');
+              return;
+            }
+            // the cluster-task pod pins imagePullPolicy: IfNotPresent, so a
+            // mutable tag (pr-<n>) can be served stale from a node's local
+            // image store after an earlier round already pulled that tag;
+            // reference the per-push immutable tag (pr-<n>-<headsha>)
+            // instead, which always resolves to the exact fresh build
+            const tagFor = sha => `${repo}:pr-${prNum}-${sha.slice(0, 7)}`;
+            // the build run registers on the PR head within seconds of the
+            // push when its paths match; grace window before deciding this
+            // push did not trigger a rebuild
+            let build = null;
+            for (let i = 0; i < 20 && !build; i++) {
+              const { data: { workflow_runs: runs } } =
+                await github.rest.actions.listWorkflowRunsForRepo({
+                  ...context.repo, head_sha: headSha,
+                  event: 'pull_request', per_page: 100,
+                });
+              build = runs.find(r => r.name === 'Build Miles Image') || null;
+              if (!build) {
+                core.info(`waiting for the image build to register (attempt ${i + 1}/20)`);
+                await new Promise(r => setTimeout(r, 30000));
+              }
+            }
+            if (!build) {
+              // this push did not rebuild the image; fall back to the
+              // immutable tag of the latest successful build for this PR
+              // branch, whose environment is still the one to test against
+              const { data: { workflow_runs: runs } } =
+                await github.rest.actions.listWorkflowRunsForRepo({
+                  ...context.repo, branch: headRef, event: 'pull_request',
+                  status: 'completed', per_page: 100,
+                });
+              const latest =
+                runs.find(r => r.name === 'Build Miles Image' && r.conclusion === 'success') || null;
+              if (latest) {
+                core.setOutput('image', tagFor(latest.head_sha));
+                core.info(`no image build for this push; testing ${tagFor(latest.head_sha)}`);
+                return;
+              }
+              core.setOutput('image', rolling);
+              core.info('no image build for this push; testing the rolling miles-v0.1.3');
+              return;
+            }
+            for (let i = 0; i < 120 && build.status !== 'completed'; i++) {
+              core.info(`waiting for the image build (attempt ${i + 1}/120, status ${build.status})`);
+              await new Promise(r => setTimeout(r, 60000));
+              const { data: run } = await github.rest.actions.getWorkflowRun({
+                ...context.repo, run_id: build.id,
+              });
+              build = run;
+            }
+            if (build.status !== 'completed') {
+              core.setFailed('timed out waiting for the image build');
+              return;
+            }
+            if (build.conclusion === 'success') {
+              core.setOutput('image', tagFor(headSha));
+              core.info(`image build succeeded; testing ${tagFor(headSha)}`);
+              return;
+            }
+            core.setFailed(`image build ended ${build.conclusion}; the PR image was not pushed, UT cannot run`);
+
+      - name: Checkout miles-for-sail
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Wait before retry (checkout)
+        if: steps.checkout.outcome == 'failure'
+        run: sleep 15
+
+      - name: Checkout miles-for-sail (retry)
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: "810 run test cases"
+        uses: flytiger-eco/shared-workflows/cluster-task@main
+        with:
+          nnodes: 0
+          nproc_per_node: 4
+          node_selector: ${{ env.NODE_SELECTOR }}
+          host_volumes: ${{ env.HOST_VOLUMES }}
+          image: ${{ steps.image.outputs.image }}
+          namespace: ${{ env.NAMESPACE }}
+          source_dir: ${{ env.SOURCE_DIR }}
+          timeout_minutes: 360
+
+          command: |
+            bash <<'PPU_MILES_TEST'
+            set -uo pipefail
+            cd "${{ env.SOURCE_DIR }}"
+            # git in the pod sees the unpacked checkout as a foreign owner
+            # ("dubious ownership", exit 128); tests that shell out to git
+            # need this to pass.
+            git config --global --add safe.directory "${PWD}" || true
+            echo "=== environment self-check ==="
+            echo "hostname=$(hostname) node=${NODE_NAME:-unknown}"
+            python --version
+            (cd /tmp && python -c "import torch; print('torch', torch.__version__, torch.__file__); print('cuda_available', torch.cuda.is_available()); print('device_count', torch.cuda.device_count())") || true
+            ppu-smi || echo "[warn] ppu-smi unavailable; check PPU device allocation of the pod"
+            echo "=== run miles PPU test case set ==="
+            bash .github/scripts/ppu/run_test_cases.sh
+            rc=$?
+            echo "[ppu-miles-test] done (exit=$rc)"
+            exit $rc
+            PPU_MILES_TEST
