@@ -218,49 +218,6 @@ jobs:
               echo "[ppu-miles-e2e] AIME alignment failed: ${AIME_ALIGNED} not produced" >&2
               exit 1
             fi
-            # Isolate the deep_ep failure site before paying for the full
-            # training warm-up: a standalone 8-rank construction of the same
-            # deep_ep Buffer the MoE dispatcher builds during training
-            # (scripts/tools/deepep_buffer_smoke.py). First run it against
-            # the image's stock deep_ep: recorded as a controlled baseline,
-            # never fatal, so the before/after comparison survives even when
-            # the stock version aborts.
-            torchrun --nproc-per-node 8 --master-port 29601 \
-              scripts/tools/deepep_buffer_smoke.py --hidden-size 2048 \
-              && echo "[ppu-miles-e2e] deep_ep smoke (stock image version): PASS" \
-              || echo "[ppu-miles-e2e] deep_ep smoke (stock image version): FAIL (recorded, continuing)"
-            # Downgrade deep_ep in-container before training (no image change):
-            # the image ships the 2.2.2 generation, whose Buffer constructor is
-            # rejected by this test cluster's development driver. 2.2.0 is the
-            # generation verified on DeepEP-healthy machines, so pin it here for
-            # this experiment round. The cluster injects http_proxy/https_proxy
-            # into worker pods; go direct for the package host, the same path
-            # the node uses for image pulls.
-            no_proxy="${no_proxy},pkg.flytiger-eco.com"
-            NO_PROXY="${no_proxy}"
-            python3 -m pip install --no-deps --quiet \
-              "https://pkg.flytiger-eco.com/artifactory/pypi_generic//deep_ep/2.2.0+v0.1.0.ppu2.2.0/deep_ep-2.2.0+cu130torch2.13.0ubuntu2404oe-cp312-cp312-linux_x86_64.whl" \
-              || { echo "[ppu-miles-e2e] deep_ep 2.2.0 install failed" >&2; exit 1; }
-            # Verify in a single python process: piping `pip show` into
-            # `grep -q` breaks under this shell's `set -o pipefail` (grep -q
-            # exits on match and closes the pipe, pip then dies with EPIPE
-            # and pipefail turns that into a false failure).
-            python3 - <<'DEEPEP_CHECK' \
-              || { echo "[ppu-miles-e2e] deep_ep is not at 2.2.0 after install" >&2; exit 1; }
-            import importlib.metadata as im
-            v = im.version("deep_ep")
-            print(f"[ppu-miles-e2e] deep_ep version: {v}")
-            assert v.startswith("2.2.0"), f"expected 2.2.0*, got {v}"
-            import deep_ep
-            print("[ppu-miles-e2e] deep_ep import OK")
-            DEEPEP_CHECK
-            # Run the same smoke again as a hard gate on the downgraded
-            # deep_ep: if the failure site itself does not pass, the full
-            # training launch is not worth the cluster time.
-            torchrun --nproc-per-node 8 --master-port 29601 \
-              scripts/tools/deepep_buffer_smoke.py --hidden-size 2048 \
-              || { echo "[ppu-miles-e2e] deep_ep buffer smoke failed at 2.2.0" >&2; exit 1; }
-            echo "[ppu-miles-e2e] deep_ep smoke (2.2.0): PASS"
             # CI-only dual workaround for the na131t development-driver
             # crashes (no repo source changes, applied at runtime):
             # (1) drop --overlap-cpu-optimizer-d2h-h2d — the param_copy_back
