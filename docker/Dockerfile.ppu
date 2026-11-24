@@ -71,10 +71,9 @@ RUN set -e && GH_PROXY="$http_proxy" SAIL_COMMIT=${SAIL_PIN} \
        bash /tmp/sglang-patches/gen_runtime_port_merge_v0.1.2.sh \
     && test -f /tmp/sglang-patches/sglang-0001-miles-v0.1.2-runtime-port-ppu-merge.patch
 
-# sglang wheel from the art source (pinned by URL + sha256)
+# sglang wheel from the art source
 # --no-deps: deps are managed below
-RUN pip install --no-deps \
-        "https://pkg.flytiger-eco.com/artifactory/pypi_generic/sglang/0.5.21+v0.1.0.ppu2.2.1/sglang-0.5.21+cu130torch2.13.0ubuntu2404oe-cp312-cp312-linux_x86_64.whl#sha256=dbf9fa16461e26045a58cc2033fb9369cf11b10ceba5f5a66976a04f0b368c0c" \
+RUN pip install --no-deps "sglang==0.5.21+v0.1.0.ppu2.2.1" \
     && python3 -c "import importlib.metadata as im; v = im.version('sglang'); assert v == '0.5.21+v0.1.0.ppu2.2.1', v"
 
 # apply both patches on site-packages (merge first, then EAGLE)
@@ -107,8 +106,7 @@ RUN pip install -c /tmp/miles_constraints.txt "tilelang==0.1.8+v0.2.0.ppu2.2.0" 
     pip install "apache-tvm-ffi==0.1.11"
 
 # flash_attn_3 (TE dual-package form; fa2 v2 is Step 7)
-RUN pip install "flash_attn_3==3.0.0+v0.2.0.ppu2.2.1" \
-        -i https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple && \
+RUN pip install "flash_attn_3==3.0.0+v0.2.0.ppu2.2.1" && \
     python3 -c "import importlib.metadata as im; assert im.version('flash-attn-3') == '3.0.0+v0.2.0.ppu2.2.1', im.version('flash-attn-3')"
 
 # pla: linear-attention kernels (KDA/GDN rollout)
@@ -164,7 +162,8 @@ RUN (git clone https://github.com/fzyzcjy/torch_memory_saver.git /tmp/tms-src \
 RUN pip config set global.trusted-host \
     "pkg.flytiger-eco.com flytiger-pkg-global.flytiger-eco.com files.pythonhosted.org pypi.org"
 
-RUN pip install "https://pkg.flytiger-eco.com/artifactory/pypi_generic//deep_ep/2.2.2+v0.1.0.ppu2.2.1/deep_ep-2.2.2+cu130torch2.13.0ubuntu2404oe-cp312-cp312-linux_x86_64.whl#sha256=5043f2859db14c4566b4f2df3fb8ba4621f27ff54b09c6dbb040bea58a88e99a" && \
+# deep_ep (art source)
+RUN pip install "deep_ep==2.2.2+v0.1.0.ppu2.2.1" && \
     python3 -c "import importlib.metadata as im; v = im.version('deep_ep'); assert v == '2.2.2+v0.1.0.ppu2.2.1', v" && \
     python3 -c "from deep_ep import Buffer; print('deep_ep Buffer OK')"
 
@@ -329,9 +328,8 @@ ENV PYTHONPATH=/root/miles:/root/Megatron-LM
 # =====================================================================
 # Step 7: flash-attn v2 (TE fa path dual-package form)
 # =====================================================================
-# flash-attn v2 (art-source direct URL)
-RUN pip install --force-reinstall --no-deps \
-        "https://pkg.flytiger-eco.com/artifactory/pypi_generic//flash_attn/2.8.2+v0.2.0.ppu2.2.1/flash_attn-2.8.2+cu130torch2.13.0ubuntu2404oe-cp312-cp312-linux_x86_64.whl#sha256=9dbeb219171a2db28b6fd5af9c31f1f748da7e2d3e5be1bda0b44f92c9dafde9" && \
+# flash-attn v2 (art source)
+RUN pip install --force-reinstall --no-deps "flash_attn==2.8.2+v0.2.0.ppu2.2.1" && \
     python3 -c "import importlib.metadata as im; assert im.version('flash-attn') == '2.8.2+v0.2.0.ppu2.2.1', im.version('flash-attn')" && \
     python3 -c "import transformer_engine as te; from transformer_engine.pytorch.attention.dot_product_attention import backends; assert backends.flash_attn_func is not None, 'TE fa2 path broken'; print('TE flash-attn dual package OK')"
 
@@ -345,7 +343,6 @@ RUN set -e; SP=/usr/local/lib/python3.12/site-packages; \
     pip uninstall -y flash-linear-attention fla-core 2>/dev/null || true; \
     rm -rf $SP/fla /tmp/fla-src; \
     pip install --no-cache-dir -c /tmp/miles_constraints.txt \
-        -i https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple \
         "flash_linear_attention==0.5.2+v0.1.0.ppu2.2.1" && \
     python3 -c "import importlib.metadata as im; \
 assert im.version('flash-linear-attention') == '0.5.2+v0.1.0.ppu2.2.1', im.version('flash-linear-attention'); \
@@ -374,8 +371,8 @@ RUN cd / && \
     [importlib.import_module(m) for m in mods]; \
     print('miles_plugins fla consumers OK')"
 
-# sglang-kernel (platform prebuilt wheel, direct URL)
-RUN pip install "https://pkg.flytiger-eco.com/artifactory/pypi_generic//sglang_kernel/0.4.7+v0.1.0.ppu2.2.1/sglang_kernel-0.4.7+cu130torch2.13.0ubuntu2404oe-cp312-cp312-linux_x86_64.whl#sha256=fc74094f79d6bad7a17d6cf37eef58763489cd1e021a60505998a0757e302533" && \
+# sglang-kernel (platform prebuilt wheel)
+RUN pip install "sglang_kernel==0.4.7+v0.1.0.ppu2.2.1" && \
     python3 -c "import importlib.metadata as im; v = im.version('sglang-kernel'); assert v == '0.4.7+v0.1.0.ppu2.2.1', v" && \
     python3 -c "from triton_kernels.numerics_details.mxfp import downcast_to_mxfp"
 
@@ -390,7 +387,7 @@ RUN printf '%s\n' \
     "image=miles-sail v0.1.2 (this repo build context; art-source prebuilt sglang wheel + site-packages patches + art-source fla platform build; zero wheel files in build context)" \
     "base=pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.1-2.13.0-ubuntu24.04-cuda13.0-py312-20261103" \
     "miles_branch=${MILES_BRANCH} (this repo's v0.1.2 branch COPY'd at build time + in-tree adaptations: colocate IPC barrier + GPU id sortkey)" \
-    "sglang=0.5.21 (art-source prebuilt whl 0.5.21+v0.1.0.ppu2.2.1 sha256=dbf9fa16461e26045a58cc2033fb9369cf11b10ceba5f5a66976a04f0b368c0c; runtime-port merge patch 176 files (gen pin @${SAIL_PIN}) + EAGLE draft oc replay/restore + decode-graph recapture patch (2 files); applied on site-packages)" \
+    "sglang=0.5.21 (art-source prebuilt whl 0.5.21+v0.1.0.ppu2.2.1; runtime-port merge patch 176 files (gen pin @${SAIL_PIN}) + EAGLE draft oc replay/restore + decode-graph recapture patch (2 files); applied on site-packages)" \
     "megatron=${MEGATRON_COMMIT} (radixark/Megatron-LM miles-main; editable; megatron-core 0.19.0)" \
     "transformer_engine=2.16+v0.1.0.ppu2.2.0 apex=24.4.1+v0.1.0.ppu2.2.0 (int4_qat kernel bundled; ppu2.2.0-generation wheels, supported on SDK 2.2.1)" \
     "flash-attn=2.8.2+v0.2.0.ppu2.2.1 + flash-attn-3 3.0.0+v0.2.0.ppu2.2.1 (TE dual-package form)" \
