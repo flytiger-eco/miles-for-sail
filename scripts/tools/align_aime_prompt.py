@@ -33,9 +33,12 @@ def load_jsonl(path: Path) -> list:
         for i, line in enumerate(f, 1):
             rec = json.loads(line)
             prompt = rec.get("prompt")
-            if (not isinstance(prompt, list) or len(prompt) != 1
+            if (
+                not isinstance(prompt, list)
+                or len(prompt) != 1
                 or prompt[0].get("role") != "user"
-                or not isinstance(prompt[0].get("content"), str)):
+                or not isinstance(prompt[0].get("content"), str)
+            ):
                 raise SystemExit(f"{path} record {i}: prompt must be a single user message")
             records.append(rec)
     return records
@@ -45,12 +48,16 @@ def common_affixes(contents: list) -> tuple:
     """Return the longest common prefix and longest common suffix of all contents."""
     prefix, suffix = contents[0], contents[0]
     for c in contents[1:]:
-        n = min(len(prefix), len(c)); i = 0
-        while i < n and prefix[i] == c[i]: i += 1
+        n = min(len(prefix), len(c))
+        i = 0
+        while i < n and prefix[i] == c[i]:
+            i += 1
         prefix = prefix[:i]
-        n = min(len(suffix), len(c)); i = 0
-        while i < n and suffix[-1 - i] == c[-1 - i]: i += 1
-        suffix = suffix[len(suffix) - i:]
+        n = min(len(suffix), len(c))
+        i = 0
+        while i < n and suffix[-1 - i] == c[-1 - i]:
+            i += 1
+        suffix = suffix[len(suffix) - i :]
     return prefix, suffix
 
 
@@ -68,11 +75,13 @@ def extract_template(train_path: Path) -> tuple:
     if not suffix.startswith(SEP):
         idx = suffix.find(SEP)
         suffix = suffix[idx:] if idx != -1 else ""
-    body = contents[0][len(prefix): len(contents[0]) - len(suffix)]
+    body = contents[0][len(prefix) : len(contents[0]) - len(suffix)]
     if not prefix or not suffix or not body.strip():
-        raise SystemExit("no consistent prompt template detected in training data "
+        raise SystemExit(
+            "no consistent prompt template detected in training data "
             "(common prefix/suffix must be separated from the body by a blank line): "
-            f"prefix={prefix[:60]!r} suffix={suffix[:60]!r}")
+            f"prefix={prefix[:60]!r} suffix={suffix[:60]!r}"
+        )
     return prefix, suffix
 
 
@@ -94,17 +103,19 @@ def main() -> None:
             for rec in records:
                 content = rec["prompt"][0]["content"]
                 if content.startswith(prefix) and content.endswith(suffix):
-                    body = content[len(prefix): len(content) - len(suffix)]
+                    body = content[len(prefix) : len(content) - len(suffix)]
                 else:
                     body = content
-                aligned = {"prompt": [{"role": "user", "content": f"{prefix}{body.strip()}{suffix}"}],
-                    "label": rec.get("label")}
+                aligned = {
+                    "prompt": [{"role": "user", "content": f"{prefix}{body.strip()}{suffix}"}],
+                    "label": rec.get("label"),
+                }
                 fout.write(json.dumps(aligned, ensure_ascii=False) + "\n")
     except PermissionError:
-        raise SystemExit(f"output directory not writable: {out.parent}; use --out to specify another path")
+        raise SystemExit(f"output directory not writable: {out.parent}; use --out to specify another path") from None
 
     with open(out, encoding="utf-8") as f:
-        for src, line in zip(records, f):
+        for src, line in zip(records, f, strict=True):
             d = json.loads(line)
             content = d["prompt"][0]["content"]
             assert content.startswith(prefix) and content.endswith(suffix)
