@@ -161,7 +161,18 @@ jobs:
         with:
           fetch-depth: 1
 
+      # Dockerfile.ppu may not be on the target branch yet when this workflow
+      # itself lands first (the CI overlay precedes the version-specific build
+      # recipe). Without a Dockerfile no image is ever pushed, so the resolved
+      # PR tag would not exist and the cluster pod would hang on image pull.
+      # Guard the test step so this check stays green until the Dockerfile
+      # lands, mirroring ppu-docker-build.yml's has_dockerfile probe.
+      - name: Check Dockerfile.ppu presence
+        id: has_dockerfile
+        run: echo "exists=$(test -f docker/Dockerfile.ppu && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
       - name: "810 run test cases"
+        if: ${{ steps.has_dockerfile.outputs.exists == 'true' }}
         uses: flytiger-eco/shared-workflows/cluster-task@main
         with:
           nnodes: 0
