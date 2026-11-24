@@ -234,6 +234,15 @@ jobs:
               echo "[ppu-miles-e2e] overlap sed failed to apply" >&2; exit 1; \
             fi
             echo "[ppu-miles-e2e] dual workaround applied: alltoall dispatcher + overlap off"
+            # CI-only workaround #3: run 45390502411 got past both crash sites
+            # (rollout complete, dispatch + MoE forward alive) and died in the
+            # log_prob forward when inductor's compile-worker subprocess failed
+            # at triton set_driver_to_gpu ("Could not find an active GPU
+            # backend") — the worker subprocess has no PPU device, while the
+            # main process does. Compiling inline (threads=1) keeps torch.compile
+            # but moves kernel compilation into the parent process.
+            export TORCHINDUCTOR_COMPILE_THREADS=1
+            echo "[ppu-miles-e2e] TORCHINDUCTOR_COMPILE_THREADS=${TORCHINDUCTOR_COMPILE_THREADS} (inline inductor compile)"
             # Short verification horizon: cap rollout steps at 5. extra_args is
             # appended last by the recipe, so this overrides the normal-mode
             # --num-rollout 3000 (argparse last-wins). Q35_EXTRA_ARGS still passes
