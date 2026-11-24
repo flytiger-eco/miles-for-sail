@@ -63,86 +63,125 @@ jobs:
         env:
           # the runner's custom container does not mount the workflow event
           # file (GITHUB_EVENT_PATH is absent), so context.payload is
-          # unavailable; pass the PR context through step env, which is
+          # unavailable; pass the event context through step env, which is
           # evaluated on the runner side before the container starts
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          BASE_REPO: ${{ github.repository }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_SHA: ${{ github.sha }}
+          REF_NAME: ${{ github.ref_name }}
         with:
           script: |
             const repo = 'ghcr.io/flytiger-eco/miles-for-sail';
             // branch-scoped rolling tag (matches the build workflow's
             // GITHUB_REF_NAME scheme; this workflow lives on the v0.1.3
-            // line, so the fallback is :miles-v0.1.3)
+            // line). Kept only as a last-resort label when no immutable
+            // build exists yet.
             const rolling = `${repo}:miles-v0.1.3`;
+            const eventName = process.env.EVENT_NAME;
+            const eventSha = process.env.EVENT_SHA;
+            const refName = process.env.REF_NAME;
             const headSha = process.env.PR_HEAD_SHA;
             const headRef = process.env.PR_HEAD_REF;
             const prNum = process.env.PR_NUMBER;
-            if (!headSha || !prNum) {
-              core.setOutput('image', rolling);
-              core.info('non-PR event: testing the rolling miles-v0.1.3');
-              return;
-            }
+            const headRepo = process.env.PR_HEAD_REPO;
+            const baseRepo = process.env.BASE_REPO;
+            const baseRef = process.env.BASE_REF;
+            const isPR = eventName === 'pull_request' && !!headSha && !!prNum;
+            // A fork PR's GITHUB_TOKEN is read-only, so its build cannot
+            // publish to the base repo's GHCR; never request that
+            // unpublished PR tag, fall back to the base branch image.
+            const isFork = isPR && !!headRepo && headRepo !== baseRepo;
             // the cluster-task pod pins imagePullPolicy: IfNotPresent, so a
-            // mutable tag (pr-<n>) can be served stale from a node's local
-            // image store after an earlier round already pulled that tag;
-            // reference the per-push immutable tag (pr-<n>-<headsha>)
-            // instead, which always resolves to the exact fresh build
-            const tagFor = sha => `${repo}:pr-${prNum}-${sha.slice(0, 7)}`;
-            // the build run registers on the PR head within seconds of the
-            // push when its paths match; grace window before deciding this
-            // push did not trigger a rebuild
-            let build = null;
-            for (let i = 0; i < 20 && !build; i++) {
+            // mutable tag can be served stale from a node's local image
+            // store. Always select an immutable per-commit tag so the pod
+            // pulls the exact fresh build: pr-<n>-<sha7> for same-repo PRs,
+            // miles-<sha7> for push/dispatch and fork fallbacks.
+            const prTag = sha => `${repo}:pr-${prNum}-${sha.slice(0, 7)}`;
+            const shaTag = sha => `${repo}:miles-${sha.slice(0, 7)}`;
+            const selTag = sha => (isPR && !isFork) ? prTag(sha) : shaTag(sha);
+            // Filter Build Miles Image runs by the current PR number as well
+            // as SHA: neither head SHA nor branch name uniquely identifies a
+            // PR (one commit can target multiple release branches, forks
+            // reuse branch names).
+            const isBuild = r => r.name === 'Build Miles Image';
+            const matchesPR = r =>
+              !isPR || (r.pull_requests || []).some(p => p.number === Number(prNum));
+            async function runsBySha(sha) {
               const { data: { workflow_runs: runs } } =
                 await github.rest.actions.listWorkflowRunsForRepo({
-                  ...context.repo, head_sha: headSha,
-                  event: 'pull_request', per_page: 100,
+                  ...context.repo, head_sha: sha, per_page: 100,
                 });
-              build = runs.find(r => r.name === 'Build Miles Image') || null;
+              return runs;
+            }
+            async function completedByBranch(branch) {
+              const { data: { workflow_runs: runs } } =
+                await github.rest.actions.listWorkflowRunsForRepo({
+                  ...context.repo, branch, status: 'completed', per_page: 100,
+                });
+              return runs;
+            }
+            // the commit whose image we test, and where to look for a
+            // published fallback when this commit did not rebuild
+            const testSha = isPR ? headSha : eventSha;
+            const fallbackBranch = isFork ? baseRef : (isPR ? headRef : refName);
+            if (!testSha) {
+              core.setOutput('image', rolling);
+              core.info('no commit context; testing the rolling tag');
+              return;
+            }
+            // grace window for the build run to register on this commit;
+            // match the event so a push never selects a PR build's tag scheme
+            let build = null;
+            for (let i = 0; i < 20 && !build; i++) {
+              build = (await runsBySha(testSha))
+                .find(r => isBuild(r) && r.event === eventName && matchesPR(r)) || null;
               if (!build) {
                 core.info(`waiting for the image build to register (attempt ${i + 1}/20)`);
                 await new Promise(r => setTimeout(r, 30000));
               }
             }
-            if (!build) {
-              // this push did not rebuild the image; fall back to the
-              // immutable tag of the latest successful build for this PR
-              // branch, whose environment is still the one to test against
-              const { data: { workflow_runs: runs } } =
-                await github.rest.actions.listWorkflowRunsForRepo({
-                  ...context.repo, branch: headRef, event: 'pull_request',
-                  status: 'completed', per_page: 100,
+            if (build) {
+              for (let i = 0; i < 120 && build.status !== 'completed'; i++) {
+                core.info(`waiting for the image build (attempt ${i + 1}/120, status ${build.status})`);
+                await new Promise(r => setTimeout(r, 60000));
+                const { data: run } = await github.rest.actions.getWorkflowRun({
+                  ...context.repo, run_id: build.id,
                 });
-              const latest =
-                runs.find(r => r.name === 'Build Miles Image' && r.conclusion === 'success') || null;
-              if (latest) {
-                core.setOutput('image', tagFor(latest.head_sha));
-                core.info(`no image build for this push; testing ${tagFor(latest.head_sha)}`);
+                build = run;
+              }
+              if (build.status !== 'completed') {
+                core.setFailed('timed out waiting for the image build');
                 return;
               }
-              core.setOutput('image', rolling);
-              core.info('no image build for this push; testing the rolling miles-v0.1.3');
+              if (build.conclusion === 'success' && !isFork) {
+                core.setOutput('image', selTag(testSha));
+                core.info(`image build succeeded; testing ${selTag(testSha)}`);
+                return;
+              }
+              if (build.conclusion !== 'success' && !isFork) {
+                core.setFailed(`image build ended ${build.conclusion}; the image was not pushed, UT cannot run`);
+                return;
+              }
+              core.info('fork PR build does not publish; falling back to the base branch image');
+            }
+            // No rebuild for this commit (or a fork build that did not
+            // publish): select the latest successful published build's
+            // immutable tag rather than the mutable rolling tag, so
+            // IfNotPresent cannot serve a stale image.
+            const latest = (await completedByBranch(fallbackBranch))
+              .find(r => isBuild(r) && r.conclusion === 'success' && (isFork || matchesPR(r))) || null;
+            if (latest) {
+              core.setOutput('image', selTag(latest.head_sha));
+              core.info(`no published build for this commit; testing ${selTag(latest.head_sha)}`);
               return;
             }
-            for (let i = 0; i < 120 && build.status !== 'completed'; i++) {
-              core.info(`waiting for the image build (attempt ${i + 1}/120, status ${build.status})`);
-              await new Promise(r => setTimeout(r, 60000));
-              const { data: run } = await github.rest.actions.getWorkflowRun({
-                ...context.repo, run_id: build.id,
-              });
-              build = run;
-            }
-            if (build.status !== 'completed') {
-              core.setFailed('timed out waiting for the image build');
-              return;
-            }
-            if (build.conclusion === 'success') {
-              core.setOutput('image', tagFor(headSha));
-              core.info(`image build succeeded; testing ${tagFor(headSha)}`);
-              return;
-            }
-            core.setFailed(`image build ended ${build.conclusion}; the PR image was not pushed, UT cannot run`);
+            core.setOutput('image', rolling);
+            core.info('no successful build found; testing the rolling tag');
 
       - name: Checkout miles-for-sail
         id: checkout
