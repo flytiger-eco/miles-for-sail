@@ -223,11 +223,6 @@ jobs:
             # --num-rollout 3000 (argparse last-wins). Q35_EXTRA_ARGS still passes
             # through and can override further.
             args+=(--extra-args "--num-rollout 5 --eval-prompt-data aime ${AIME_ALIGNED} ${Q35_EXTRA_ARGS}")
-            # The platform development driver rejects async H2D copies on
-            # non-default CUDA streams created by the hybrid optimizer's
-            # overlap mode.  Drop the flag so D2H/H2D uses the default
-            # stream (blocking semantics) instead.
-            sed -i '/--overlap-cpu-optimizer-d2h-h2d/d' scripts/run_qwen3_5_35b_a3b_mtp.py
             echo "[ppu-miles-e2e] launching training with: ${args[*]}"
             python3 scripts/run_qwen3_5_35b_a3b_mtp.py "${args[@]}"
             rc=$?
