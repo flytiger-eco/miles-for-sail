@@ -218,6 +218,17 @@ jobs:
               echo "[ppu-miles-e2e] AIME alignment failed: ${AIME_ALIGNED} not produced" >&2
               exit 1
             fi
+            # Isolate the deep_ep failure site before paying for the full
+            # training warm-up: a standalone 8-rank construction of the same
+            # deep_ep Buffer the MoE dispatcher builds during training
+            # (scripts/tools/deepep_buffer_smoke.py). First run it against
+            # the image's stock deep_ep: recorded as a controlled baseline,
+            # never fatal, so the before/after comparison survives even when
+            # the stock version aborts.
+            torchrun --nproc-per-node 8 --master-port 29601 \
+              scripts/tools/deepep_buffer_smoke.py --hidden-size 2048 \
+              && echo "[ppu-miles-e2e] deep_ep smoke (stock image version): PASS" \
+              || echo "[ppu-miles-e2e] deep_ep smoke (stock image version): FAIL (recorded, continuing)"
             # Downgrade deep_ep in-container before training (no image change):
             # the image ships the 2.2.2 generation, whose Buffer constructor is
             # rejected by this test cluster's development driver. 2.2.0 is the
@@ -243,6 +254,13 @@ jobs:
             import deep_ep
             print("[ppu-miles-e2e] deep_ep import OK")
             DEEPEP_CHECK
+            # Run the same smoke again as a hard gate on the downgraded
+            # deep_ep: if the failure site itself does not pass, the full
+            # training launch is not worth the cluster time.
+            torchrun --nproc-per-node 8 --master-port 29601 \
+              scripts/tools/deepep_buffer_smoke.py --hidden-size 2048 \
+              || { echo "[ppu-miles-e2e] deep_ep buffer smoke failed at 2.2.0" >&2; exit 1; }
+            echo "[ppu-miles-e2e] deep_ep smoke (2.2.0): PASS"
             # Short verification horizon: cap rollout steps at 5. extra_args is
             # appended last by the recipe, so this overrides the normal-mode
             # --num-rollout 3000 (argparse last-wins). Q35_EXTRA_ARGS still passes
