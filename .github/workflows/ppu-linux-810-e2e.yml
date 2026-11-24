@@ -261,6 +261,22 @@ jobs:
               scripts/tools/deepep_buffer_smoke.py --hidden-size 2048 \
               || { echo "[ppu-miles-e2e] deep_ep buffer smoke failed at 2.2.0" >&2; exit 1; }
             echo "[ppu-miles-e2e] deep_ep smoke (2.2.0): PASS"
+            # CI-only dual workaround for the na131t development-driver
+            # crashes (no repo source changes, applied at runtime):
+            # (1) drop --overlap-cpu-optimizer-d2h-h2d — the param_copy_back
+            # H2D crash reproduces with both deep_ep versions, so overlap is
+            # the discriminating variable; (2) swap the flex (DeepEP) token
+            # dispatcher for the alltoall dispatcher — the deep_ep Buffer
+            # crash in forward comes from flex's fused dispatch/combine path.
+            # This probes the overlap-off + deepep-off combination.
+            sed -i 's/--moe-token-dispatcher-type flex /--moe-token-dispatcher-type alltoall /' scripts/run_qwen3_5_35b_a3b_mtp.py
+            sed -i '/--overlap-cpu-optimizer-d2h-h2d/d' scripts/run_qwen3_5_35b_a3b_mtp.py
+            grep -q -- '--moe-token-dispatcher-type alltoall ' scripts/run_qwen3_5_35b_a3b_mtp.py \
+              || { echo "[ppu-miles-e2e] dispatcher sed failed to apply" >&2; exit 1; }
+            if grep -q -- '--overlap-cpu-optimizer-d2h-h2d' scripts/run_qwen3_5_35b_a3b_mtp.py; then \
+              echo "[ppu-miles-e2e] overlap sed failed to apply" >&2; exit 1; \
+            fi
+            echo "[ppu-miles-e2e] dual workaround applied: alltoall dispatcher + overlap off"
             # Short verification horizon: cap rollout steps at 5. extra_args is
             # appended last by the recipe, so this overrides the normal-mode
             # --num-rollout 3000 (argparse last-wins). Q35_EXTRA_ARGS still passes
