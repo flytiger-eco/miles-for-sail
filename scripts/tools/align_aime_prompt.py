@@ -97,6 +97,9 @@ def main() -> None:
     print(f"template suffix: {suffix!r}")
 
     out = args.out or args.test.parent / f"{args.test.stem}-aligned.jsonl"
+    for source in (args.train, args.test):
+        if out.resolve() == source.resolve() or (out.exists() and out.samefile(source)):
+            parser.error(f"output path must not overwrite input file: {source}")
     records = load_jsonl(args.test)
     try:
         with open(out, "w", encoding="utf-8") as fout:
