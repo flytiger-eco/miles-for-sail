@@ -1,0 +1,114 @@
+# Copyright © 2026 Zhejiang Runhe Cloud Intelligence Technology Co., Ltd
+
+name: ppu-linux-810-e2e
+
+on:
+  pull_request:
+    branches:
+      - v*
+    paths:
+      - '.github/workflows/ppu-linux-810-e2e.yml'
+      - 'tests/e2e/**'
+      - 'miles/**'
+  push:
+    branches:
+      - v*
+    paths:
+      - '.github/workflows/ppu-linux-810-e2e.yml'
+      - 'tests/e2e/**'
+      - 'miles/**'
+  workflow_dispatch:
+    inputs:
+      run_quick_start:
+        description: 'Run the 2-card quick-start end-to-end case'
+        required: false
+        type: boolean
+        default: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  # Branch-scoped tag refreshed by matching v0.1.2 pushes or publishing dispatches.
+  IMAGE: ghcr.io/flytiger-eco/miles-for-sail:miles-v0.1.2
+  NAMESPACE: ppu-sched
+  HOST_VOLUMES: "/nas_aisw:/nas_aisw,/wl_nas:/mnt/wl_nas"
+  SOURCE_DIR: /workspace/source
+  NODE_SELECTOR: "board-type=OAM-810E"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  quick-start-e2e:
+    name: ppu-e2e quick-start (810E 2 cards)
+    if: github.event_name != 'workflow_dispatch' || inputs.run_quick_start
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 240
+
+    steps:
+      - name: Checkout miles-for-sail
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Wait before retry (checkout)
+        if: steps.checkout.outcome == 'failure'
+        run: sleep 15
+
+      - name: Checkout miles-for-sail (retry)
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: "810 run quick-start end-to-end case"
+        uses: flytiger-eco/shared-workflows/cluster-task@main
+        with:
+          nnodes: 0
+          nproc_per_node: 2
+          node_selector: ${{ env.NODE_SELECTOR }}
+          host_volumes: ${{ env.HOST_VOLUMES }}
+          image: ${{ env.IMAGE }}
+          namespace: ${{ env.NAMESPACE }}
+          source_dir: ${{ env.SOURCE_DIR }}
+          timeout_minutes: 180
+
+          command: |
+            bash <<'PPU_MILES_E2E'
+            set -uo pipefail
+            cd "${{ env.SOURCE_DIR }}"
+            export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
+            # git in the pod sees the unpacked checkout as a foreign owner
+            # ("dubious ownership", exit 128); tests that shell out to git
+            # need this to pass.
+            git config --global --add safe.directory "${PWD}" || true
+            export HF_ENDPOINT=https://hf-mirror.com
+            # Mirror downloads can fail mid-transfer with read timeouts; the
+            # case downloads model and dataset itself and completed downloads
+            # resume, so retry a bounded number of times before giving up.
+            rc=1
+            for attempt in 1 2 3; do
+              if CUDA_VISIBLE_DEVICES=0,1 \
+                 python3 tests/e2e/short/test_qwen2.5_0.5B_gsm8k_short.py; then
+                rc=0
+                break
+              else
+                rc=$?
+              fi
+              echo "[ppu-miles-e2e] attempt ${attempt} failed (exit=${rc}); retrying after a pause"
+              sleep 30
+            done
+            echo "[ppu-miles-e2e] done (exit=${rc})"
+            exit "${rc}"
+            PPU_MILES_E2E
