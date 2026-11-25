@@ -82,6 +82,9 @@ def sort_key(x):
             # representation that allows for sorting.
             node_ip_parts = [ord(c) for c in node_identifier]
 
+    # Ray may return numeric strings or UUIDs; numeric IDs must not sort lexicographically.
+    if isinstance(gpu_id, str) and gpu_id.isdigit():
+        gpu_id = int(gpu_id)
     return (node_ip_parts, gpu_id)
 
 
