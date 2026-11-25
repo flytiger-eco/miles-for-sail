@@ -1,0 +1,251 @@
+# Copyright © 2026 Zhejiang Runhe Cloud Intelligence Technology Co., Ltd
+
+name: ppu-linux-810-test
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - v*
+    paths:
+      - '.github/workflows/ppu-linux-810-test.yml'
+      - '.github/scripts/ppu/**'
+      - 'tests/**'
+      - 'miles/**'
+      - 'docker/**'
+  push:
+    branches:
+      - v*
+    paths:
+      - '.github/workflows/ppu-linux-810-test.yml'
+      - '.github/scripts/ppu/**'
+      - 'tests/**'
+      - 'miles/**'
+      - 'docker/**'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  NAMESPACE: ppu-sched
+  HOST_VOLUMES: "/nas_aisw:/nas_aisw,/wl_nas:/mnt/wl_nas"
+  SOURCE_DIR: /workspace/source
+  NODE_SELECTOR: "board-type=OAM-810E"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  test:
+    name: ppu-test (810E 4 cards)
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    # 240 minutes for image resolution, 360 for the cluster task, and 30 for setup/cleanup.
+    timeout-minutes: 630
+
+    steps:
+      - name: Checkout miles-for-sail
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Wait before retry (checkout)
+        if: steps.checkout.outcome == 'failure'
+        run: sleep 15
+
+      - name: Checkout miles-for-sail (retry)
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Check Dockerfile.ppu presence
+        id: has_dockerfile
+        run: |
+          if test -f docker/Dockerfile.ppu; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "810E UT skipped: docker/Dockerfile.ppu is absent; no tests were run." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Resolve published test image
+        if: ${{ steps.has_dockerfile.outputs.exists == 'true' }}
+        id: image
+        timeout-minutes: 240
+        uses: actions/github-script@v7
+        env:
+          # the runner's custom container does not mount the workflow event
+          # file (GITHUB_EVENT_PATH is absent), so context.payload is
+          # unavailable; pass the event context through step env, which is
+          # evaluated on the runner side before the container starts
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          BASE_REPO: ${{ github.repository }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_SHA: ${{ github.sha }}
+          REF_NAME: ${{ github.ref_name }}
+        with:
+          script: |
+            const fs = require('node:fs');
+            const os = require('node:os');
+            const path = require('node:path');
+            const { execFileSync } = require('node:child_process');
+            const eventName = process.env.EVENT_NAME;
+            const eventSha = process.env.EVENT_SHA;
+            const refName = process.env.REF_NAME;
+            const headSha = process.env.PR_HEAD_SHA;
+            const headRef = process.env.PR_HEAD_REF;
+            const prNum = process.env.PR_NUMBER;
+            const headRepo = process.env.PR_HEAD_REPO;
+            const baseRepo = process.env.BASE_REPO;
+            const baseRef = process.env.BASE_REF;
+            const isPR = eventName === 'pull_request' && !!headSha && !!prNum;
+            const isFork = isPR && headRepo !== baseRepo;
+            const matchesPR = r =>
+              r.event === 'pull_request' && r.head_repository?.full_name === baseRepo &&
+              (r.pull_requests || []).some(p => p.number === Number(prNum));
+            const workflow = { ...context.repo, workflow_id: 'ppu-docker-build.yml', per_page: 100 };
+
+            async function publishedImage(run) {
+              const artifacts = await github.paginate(github.rest.actions.listWorkflowRunArtifacts, {
+                ...context.repo, run_id: run.id, per_page: 100,
+              });
+              const artifact = artifacts.find(a =>
+                a.name === `ppu-image-publication-${run.run_attempt}` && !a.expired);
+              if (!artifact) return null;
+              const { data } = await github.rest.actions.downloadArtifact({
+                ...context.repo, artifact_id: artifact.id, archive_format: 'zip',
+              });
+              const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ppu-image-'));
+              let publication;
+              try {
+                const archive = path.join(dir, 'publication.zip');
+                fs.writeFileSync(archive, Buffer.from(data));
+                publication = JSON.parse(execFileSync('unzip', [
+                  '-p', archive, 'ppu-image-publication.json',
+                ], { encoding: 'utf8', maxBuffer: 1024 * 1024 }));
+              } finally {
+                fs.rmSync(dir, { recursive: true, force: true });
+              }
+              if (publication.published !== true) return null;
+              if (typeof publication.image !== 'string' ||
+                  !/^[a-z0-9][a-z0-9._:/-]*@sha256:[a-f0-9]{64}$/.test(publication.image)) {
+                throw new Error(`invalid published image reference in build ${run.id}`);
+              }
+              return publication.image;
+            }
+
+            const testSha = isPR ? headSha : eventSha;
+            if (!testSha) {
+              core.setFailed('missing commit context; cannot select a published image');
+              return;
+            }
+            let build = null;
+            // Fork builds cannot publish, so waiting for them cannot provide a test image.
+            for (let i = 0; !isFork && i < 20 && !build; i++) {
+              const runs = await github.paginate(github.rest.actions.listWorkflowRuns, {
+                ...workflow, head_sha: testSha, event: eventName,
+              });
+              build = runs.find(r => r.head_repository?.full_name === baseRepo &&
+                (isPR ? matchesPR(r) : r.head_branch === refName)) || null;
+              if (!build) {
+                core.info(`waiting for the image build to register (attempt ${i + 1}/20)`);
+                await new Promise(r => setTimeout(r, 30000));
+              }
+            }
+            if (build) {
+              // Allow the 180-minute build plus 30 minutes of queueing.
+              const deadline = Date.now() + 210 * 60000;
+              while (build.status !== 'completed' && Date.now() < deadline) {
+                core.info(`waiting for the image build (status ${build.status})`);
+                await new Promise(r => setTimeout(r, Math.min(60000, deadline - Date.now())));
+                const { data: run } = await github.rest.actions.getWorkflowRun({
+                  ...context.repo, run_id: build.id,
+                });
+                build = run;
+              }
+              if (build.status !== 'completed') {
+                core.setFailed('timed out waiting for the image build');
+                return;
+              }
+              if (build.conclusion !== 'success') {
+                core.setFailed(`image build ended ${build.conclusion}; UT cannot run`);
+                return;
+              }
+              const image = await publishedImage(build);
+              if (image) {
+                core.setOutput('image', image);
+                core.info(`image build published ${image}`);
+                return;
+              }
+              core.info('image build did not record a published image; checking earlier builds');
+            }
+
+            const scopes = [];
+            if (isPR && !isFork) scopes.push({ branch: headRef, accepts: matchesPR });
+            scopes.push({
+              branch: isPR ? baseRef : refName,
+              accepts: r => ['push', 'workflow_dispatch'].includes(r.event) &&
+                r.head_repository?.full_name === baseRepo,
+            });
+            for (const { branch, accepts } of scopes) {
+              for await (const { data: runs } of github.paginate.iterator(
+                github.rest.actions.listWorkflowRuns, { ...workflow, branch, status: 'success' },
+              )) {
+                for (const run of runs) {
+                  if (!accepts(run) || run.id === build?.id) continue;
+                  const image = await publishedImage(run);
+                  if (!image) continue;
+                  core.setOutput('image', image);
+                  core.info(`using published image from build ${run.id}: ${image}`);
+                  return;
+                }
+              }
+            }
+            core.setFailed('no compatible published image found; run Build Miles Image with publishing enabled');
+
+      - name: "810 run test cases"
+        if: ${{ steps.has_dockerfile.outputs.exists == 'true' }}
+        uses: flytiger-eco/shared-workflows/cluster-task@main
+        with:
+          nnodes: 0
+          nproc_per_node: 4
+          node_selector: ${{ env.NODE_SELECTOR }}
+          host_volumes: ${{ env.HOST_VOLUMES }}
+          image: ${{ steps.image.outputs.image }}
+          namespace: ${{ env.NAMESPACE }}
+          source_dir: ${{ env.SOURCE_DIR }}
+          timeout_minutes: 360
+
+          command: |
+            bash <<'PPU_MILES_TEST'
+            set -uo pipefail
+            cd "${{ env.SOURCE_DIR }}"
+            # git in the pod sees the unpacked checkout as a foreign owner
+            # ("dubious ownership", exit 128); tests that shell out to git
+            # need this to pass.
+            git config --global --add safe.directory "${PWD}" || true
+            echo "=== environment self-check ==="
+            echo "hostname=$(hostname) node=${NODE_NAME:-unknown}"
+            python --version
+            (cd /tmp && python -c "import torch; print('torch', torch.__version__, torch.__file__); print('cuda_available', torch.cuda.is_available()); print('device_count', torch.cuda.device_count())") || true
+            ppu-smi || echo "[warn] ppu-smi unavailable; check PPU device allocation of the pod"
+            echo "=== run miles PPU test case set ==="
+            bash .github/scripts/ppu/run_test_cases.sh
+            rc=$?
+            echo "[ppu-miles-test] done (exit=$rc)"
+            exit $rc
+            PPU_MILES_TEST
