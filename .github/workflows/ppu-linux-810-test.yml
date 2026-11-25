@@ -50,14 +50,35 @@ jobs:
     timeout-minutes: 420
 
     steps:
-      # Dockerfile PRs push immutable per-push tags (default-upload policy in
-      # ppu-docker-build.yml). The image build runs in parallel with this
-      # workflow, so wait for it to complete and test the matching PR image;
-      # pushes that did not rebuild (e.g. workflow-only changes) fall back to
-      # the latest built PR image. A workflow_run chain would be cleaner
-      # but only registers from the default branch, which does not carry
-      # this workflow file.
-      - name: Resolve test image (wait for the PR image build)
+      - name: Checkout miles-for-sail
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Wait before retry (checkout)
+        if: steps.checkout.outcome == 'failure'
+        run: sleep 15
+
+      - name: Checkout miles-for-sail (retry)
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Check Dockerfile.ppu presence
+        id: has_dockerfile
+        run: |
+          if test -f docker/Dockerfile.ppu; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "810E UT skipped: docker/Dockerfile.ppu is absent; no tests were run." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Resolve published test image
+        if: ${{ steps.has_dockerfile.outputs.exists == 'true' }}
         id: image
         uses: actions/github-script@v7
         env:
@@ -76,12 +97,10 @@ jobs:
           REF_NAME: ${{ github.ref_name }}
         with:
           script: |
-            const repo = 'ghcr.io/flytiger-eco/miles-for-sail';
-            // branch-scoped rolling tag (matches the build workflow's
-            // GITHUB_REF_NAME scheme; this workflow lives on the v0.1.3
-            // line). Kept only as a last-resort label when no immutable
-            // build exists yet.
-            const rolling = `${repo}:miles-v0.1.3`;
+            const fs = require('node:fs');
+            const os = require('node:os');
+            const path = require('node:path');
+            const { execFileSync } = require('node:child_process');
             const eventName = process.env.EVENT_NAME;
             const eventSha = process.env.EVENT_SHA;
             const refName = process.env.REF_NAME;
@@ -92,54 +111,54 @@ jobs:
             const baseRepo = process.env.BASE_REPO;
             const baseRef = process.env.BASE_REF;
             const isPR = eventName === 'pull_request' && !!headSha && !!prNum;
-            // A fork PR's GITHUB_TOKEN is read-only, so its build cannot
-            // publish to the base repo's GHCR; never request that
-            // unpublished PR tag, fall back to the base branch image.
-            const isFork = isPR && !!headRepo && headRepo !== baseRepo;
-            // the cluster-task pod pins imagePullPolicy: IfNotPresent, so a
-            // mutable tag can be served stale from a node's local image
-            // store. Always select an immutable per-commit tag so the pod
-            // pulls the exact fresh build: pr-<n>-<sha7> for same-repo PRs,
-            // miles-<sha7> for push/dispatch and fork fallbacks.
-            const prTag = sha => `${repo}:pr-${prNum}-${sha.slice(0, 7)}`;
-            const shaTag = sha => `${repo}:miles-${sha.slice(0, 7)}`;
-            const selTag = sha => (isPR && !isFork) ? prTag(sha) : shaTag(sha);
-            // Filter Build Miles Image runs by the current PR number as well
-            // as SHA: neither head SHA nor branch name uniquely identifies a
-            // PR (one commit can target multiple release branches, forks
-            // reuse branch names).
-            const isBuild = r => r.name === 'Build Miles Image';
+            const isFork = isPR && headRepo !== baseRepo;
             const matchesPR = r =>
-              !isPR || (r.pull_requests || []).some(p => p.number === Number(prNum));
-            async function runsBySha(sha) {
-              const { data: { workflow_runs: runs } } =
-                await github.rest.actions.listWorkflowRunsForRepo({
-                  ...context.repo, head_sha: sha, per_page: 100,
-                });
-              return runs;
+              r.event === 'pull_request' && r.head_repository?.full_name === baseRepo &&
+              (r.pull_requests || []).some(p => p.number === Number(prNum));
+            const workflow = { ...context.repo, workflow_id: 'ppu-docker-build.yml', per_page: 100 };
+
+            async function publishedImage(run) {
+              const artifacts = await github.paginate(github.rest.actions.listWorkflowRunArtifacts, {
+                ...context.repo, run_id: run.id, per_page: 100,
+              });
+              const artifact = artifacts.find(a =>
+                a.name === `ppu-image-publication-${run.run_attempt}` && !a.expired);
+              if (!artifact) return null;
+              const { data } = await github.rest.actions.downloadArtifact({
+                ...context.repo, artifact_id: artifact.id, archive_format: 'zip',
+              });
+              const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ppu-image-'));
+              let publication;
+              try {
+                const archive = path.join(dir, 'publication.zip');
+                fs.writeFileSync(archive, Buffer.from(data));
+                publication = JSON.parse(execFileSync('unzip', [
+                  '-p', archive, 'ppu-image-publication.json',
+                ], { encoding: 'utf8', maxBuffer: 1024 * 1024 }));
+              } finally {
+                fs.rmSync(dir, { recursive: true, force: true });
+              }
+              if (publication.published !== true) return null;
+              if (typeof publication.image !== 'string' ||
+                  !/^[a-z0-9][a-z0-9._:/-]*@sha256:[a-f0-9]{64}$/.test(publication.image)) {
+                throw new Error(`invalid published image reference in build ${run.id}`);
+              }
+              return publication.image;
             }
-            async function completedByBranch(branch) {
-              const { data: { workflow_runs: runs } } =
-                await github.rest.actions.listWorkflowRunsForRepo({
-                  ...context.repo, branch, status: 'completed', per_page: 100,
-                });
-              return runs;
-            }
-            // the commit whose image we test, and where to look for a
-            // published fallback when this commit did not rebuild
+
             const testSha = isPR ? headSha : eventSha;
-            const fallbackBranch = isFork ? baseRef : (isPR ? headRef : refName);
             if (!testSha) {
-              core.setOutput('image', rolling);
-              core.info('no commit context; testing the rolling tag');
+              core.setFailed('missing commit context; cannot select a published image');
               return;
             }
-            // grace window for the build run to register on this commit;
-            // match the event so a push never selects a PR build's tag scheme
             let build = null;
-            for (let i = 0; i < 20 && !build; i++) {
-              build = (await runsBySha(testSha))
-                .find(r => isBuild(r) && r.event === eventName && matchesPR(r)) || null;
+            // Fork builds cannot publish, so waiting for them cannot provide a test image.
+            for (let i = 0; !isFork && i < 20 && !build; i++) {
+              const runs = await github.paginate(github.rest.actions.listWorkflowRuns, {
+                ...workflow, head_sha: testSha, event: eventName,
+              });
+              build = runs.find(r => r.head_repository?.full_name === baseRepo &&
+                (isPR ? matchesPR(r) : r.head_branch === refName)) || null;
               if (!build) {
                 core.info(`waiting for the image build to register (attempt ${i + 1}/20)`);
                 await new Promise(r => setTimeout(r, 30000));
@@ -158,57 +177,41 @@ jobs:
                 core.setFailed('timed out waiting for the image build');
                 return;
               }
-              if (build.conclusion === 'success' && !isFork) {
-                core.setOutput('image', selTag(testSha));
-                core.info(`image build succeeded; testing ${selTag(testSha)}`);
+              if (build.conclusion !== 'success') {
+                core.setFailed(`image build ended ${build.conclusion}; UT cannot run`);
                 return;
               }
-              if (build.conclusion !== 'success' && !isFork) {
-                core.setFailed(`image build ended ${build.conclusion}; the image was not pushed, UT cannot run`);
+              const image = await publishedImage(build);
+              if (image) {
+                core.setOutput('image', image);
+                core.info(`image build published ${image}`);
                 return;
               }
-              core.info('fork PR build does not publish; falling back to the base branch image');
+              core.info('image build did not record a published image; checking earlier builds');
             }
-            // No rebuild for this commit (or a fork build that did not
-            // publish): select the latest successful published build's
-            // immutable tag rather than the mutable rolling tag, so
-            // IfNotPresent cannot serve a stale image.
-            const latest = (await completedByBranch(fallbackBranch))
-              .find(r => isBuild(r) && r.conclusion === 'success' && (isFork || matchesPR(r))) || null;
-            if (latest) {
-              core.setOutput('image', selTag(latest.head_sha));
-              core.info(`no published build for this commit; testing ${selTag(latest.head_sha)}`);
-              return;
+
+            const scopes = [];
+            if (isPR && !isFork) scopes.push({ branch: headRef, accepts: matchesPR });
+            scopes.push({
+              branch: isPR ? baseRef : refName,
+              accepts: r => ['push', 'workflow_dispatch'].includes(r.event) &&
+                r.head_repository?.full_name === baseRepo,
+            });
+            for (const { branch, accepts } of scopes) {
+              for await (const { data: runs } of github.paginate.iterator(
+                github.rest.actions.listWorkflowRuns, { ...workflow, branch, status: 'success' },
+              )) {
+                for (const run of runs) {
+                  if (!accepts(run) || run.id === build?.id) continue;
+                  const image = await publishedImage(run);
+                  if (!image) continue;
+                  core.setOutput('image', image);
+                  core.info(`using published image from build ${run.id}: ${image}`);
+                  return;
+                }
+              }
             }
-            core.setOutput('image', rolling);
-            core.info('no successful build found; testing the rolling tag');
-
-      - name: Checkout miles-for-sail
-        id: checkout
-        continue-on-error: true
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-
-      - name: Wait before retry (checkout)
-        if: steps.checkout.outcome == 'failure'
-        run: sleep 15
-
-      - name: Checkout miles-for-sail (retry)
-        if: steps.checkout.outcome == 'failure'
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-
-      # Dockerfile.ppu may not be on the target branch yet when this workflow
-      # itself lands first (the CI overlay precedes the version-specific build
-      # recipe). Without a Dockerfile no image is ever pushed, so the resolved
-      # PR tag would not exist and the cluster pod would hang on image pull.
-      # Guard the test step so this check stays green until the Dockerfile
-      # lands, mirroring ppu-docker-build.yml's has_dockerfile probe.
-      - name: Check Dockerfile.ppu presence
-        id: has_dockerfile
-        run: echo "exists=$(test -f docker/Dockerfile.ppu && echo true || echo false)" >> "$GITHUB_OUTPUT"
+            core.setFailed('no compatible published image found; run Build Miles Image with publishing enabled');
 
       - name: "810 run test cases"
         if: ${{ steps.has_dockerfile.outputs.exists == 'true' }}
