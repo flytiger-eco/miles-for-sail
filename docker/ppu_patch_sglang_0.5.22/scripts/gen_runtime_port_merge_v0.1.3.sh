@@ -41,9 +41,9 @@ MERGE_BRANCH=port/sglang-miles-v0.5.22-v0.1.3
 # the delta is only the MiniMax-M3 MSA 4-file rename, and the merge patch is
 # byte-identical). The value must change once sglang-for-sail moves ahead --
 # fail loudly to force a conflict re-review and a pin refresh.
-MERGE_TREE_EXPECT=${MERGE_TREE_EXPECT:-0701d89629d8285a9be8959676514f47b2391945}
-MERGE_STAT_EXPECT=${MERGE_STAT_EXPECT:-190 files changed, 10432 insertions(+), 3134 deletions(-)}
-MERGE_FILES_EXPECT=${MERGE_FILES_EXPECT:-190}
+MERGE_TREE_EXPECT=${MERGE_TREE_EXPECT-0701d89629d8285a9be8959676514f47b2391945}
+MERGE_STAT_EXPECT=${MERGE_STAT_EXPECT-190 files changed, 10432 insertions(+), 3134 deletions(-)}
+MERGE_FILES_EXPECT=${MERGE_FILES_EXPECT-190}
 
 # fetch depth: theirs is 51 commits ahead of base, ours 133+; the depth must
 # cover every commit ahead or a shallow cut empties the merge-base.
