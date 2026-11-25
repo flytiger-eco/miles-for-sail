@@ -234,6 +234,8 @@ jobs:
               echo "[ppu-miles-e2e] overlap sed failed to apply" >&2; exit 1; \
             fi
             echo "[ppu-miles-e2e] dual workaround applied: alltoall dispatcher + overlap off"
+            # (3) TORCHINDUCTOR_COMPILE_THREADS=1 and (4) the bf16 Adam moments
+            # below complete the CI-only crash/OOM avoidance stack.
             # CI-only workaround #3: run 45390502411 got past both crash sites
             # (rollout complete, dispatch + MoE forward alive) and died in the
             # log_prob forward when inductor's compile-worker subprocess failed
@@ -243,6 +245,20 @@ jobs:
             # but moves kernel compilation into the parent process.
             export TORCHINDUCTOR_COMPILE_THREADS=1
             echo "[ppu-miles-e2e] TORCHINDUCTOR_COMPILE_THREADS=${TORCHINDUCTOR_COMPILE_THREADS} (inline inductor compile)"
+            # CI-only workaround #4: run 45421862403 attempt 3 got past the
+            # engine boot and a full rollout (256 samples), then the first
+            # optimizer step pinned the node's host RAM at 895.63/896.00 GB and
+            # the Ray OOM killer reaped a MegatronTrainRayActor (8 ranks, each
+            # ~88 GB: fp32 Adam m/v ~53 GB + fp32 master + pinned backups —
+            # the designed layout of --optimizer-cpu-offload at TP8, no leak).
+            # Store the Adam moments in bf16 instead (allowed by the already
+            # enabled --use-precision-aware-optimizer; kernel math stays fp32,
+            # this is a storage dtype only), halving the per-rank moment cost
+            # by ~26 GB and freeing ~211 GB of node RAM.
+            sed -i 's/--use-precision-aware-optimizer /--use-precision-aware-optimizer --exp-avg-dtype bf16 --exp-avg-sq-dtype bf16 /' scripts/run_qwen3_5_35b_a3b_mtp.py
+            grep -q -- '--exp-avg-dtype bf16 --exp-avg-sq-dtype bf16' scripts/run_qwen3_5_35b_a3b_mtp.py \
+              || { echo "[ppu-miles-e2e] moments-dtype sed failed to apply" >&2; exit 1; }
+            echo "[ppu-miles-e2e] low-precision Adam moments applied: exp-avg/exp-avg-sq bf16"
             # Short verification horizon: cap rollout steps at 5. extra_args is
             # appended last by the recipe, so this overrides the normal-mode
             # --num-rollout 3000 (argparse last-wins). Q35_EXTRA_ARGS still passes
