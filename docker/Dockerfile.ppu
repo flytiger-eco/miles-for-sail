@@ -111,8 +111,9 @@ RUN cd /sgl-workspace/sglang/python \
     && pip install --force-reinstall --no-deps --no-build-isolation . \
     && python3 -c "import importlib.metadata as im; assert im.version('sglang') == '0.5.22', im.version('sglang')"
 
-# kernel ecosystem (the art source resolves platform-customized builds)
-RUN pip install "tilelang==0.1.8" "deep_gemm>=1.1.0" flash_mla "acext>=1.1.0" && \
+# The TileLang index installer forces an alios7u2 lookup; this environment has an Ubuntu-only wheel.
+RUN pip install "https://pkg.flytiger-eco.com/artifactory/pypi_generic//tilelang/0.1.8+v0.2.0.ppu2.2.0/tilelang-0.1.8+cu130torch2.13.0ubuntu2404oe-cp312-cp312-linux_x86_64.whl" \
+        "deep_gemm>=1.1.0" flash_mla "acext>=1.1.0" && \
     pip install "flashinfer_python==0.6.17+v0.1.0.ppu2.2.0" --no-deps && \
     pip install "apache-tvm-ffi==0.1.11"
 
