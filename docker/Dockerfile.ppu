@@ -354,31 +354,28 @@ RUN pip install --force-reinstall --no-deps \
     python3 -c "import transformer_engine as te; from transformer_engine.pytorch.attention.dot_product_attention import backends; assert backends.flash_attn_func is not None, 'TE fa2 path broken'; print('TE flash-attn dual package OK')"
 
 # =====================================================================
-# Step 8: FLA 0.5.2 platform fork (flash-linear-attention-for-sail)
-#         + KDA hoist + sglang-kernel
+# Step 8: FLA 0.5.2 art-source platform build + KDA hoist + sglang-kernel
 # =====================================================================
 
-# fla: the platform-optimised fork of v0.5.2
-ARG FLA_REPO=https://github.com/fla-platform-fork/flash-linear-attention-for-sail
-ARG FLA_COMMIT=c48ffb59794c80fcc0b426b799bb5c7d5979e926
+# fla: art-source platform build (shell + fla-core split package), v0.1.2
+# install form. NOT --no-deps: the shell's real payload is its dependency
+# on fla-core. fla-core is pinned explicitly: the shell declares the public
+# pin fla-core==0.5.2, which would otherwise resolve to the newer ppu2.2.1
+# build instead of this SDK 2.2.0 generation.
 RUN set -e; SP=/usr/local/lib/python3.12/site-packages; \
     pip uninstall -y flash-linear-attention fla-core 2>/dev/null || true; \
     rm -rf $SP/fla /tmp/fla-src; \
-    (git clone --depth 1 -b v0.5.2 ${FLA_REPO} /tmp/fla-src \
-        || (rm -rf /tmp/fla-src; sleep 15; \
-            git clone --depth 1 -b v0.5.2 ${FLA_REPO} /tmp/fla-src)) \
-    && git -C /tmp/fla-src fetch -q --depth 1 origin ${FLA_COMMIT} \
-    && git -C /tmp/fla-src checkout -q --detach FETCH_HEAD \
-    && test "$(git -C /tmp/fla-src rev-parse HEAD)" = "${FLA_COMMIT}" \
-    && pip install --no-deps --no-build-isolation --force-reinstall /tmp/fla-src \
-    && python3 -c "import importlib.metadata as im; \
-assert im.version('flash-linear-attention') == '0.5.2', im.version('flash-linear-attention')" && \
-    python3 -c "import fla.ops.kda.chunk_intra_token_parallel; print('fla platform fork 0.5.2 install check OK')"
+    pip install --no-cache-dir -c /tmp/miles_constraints.txt \
+        "flash_linear_attention==0.5.2+v0.1.0.ppu2.2.0" "fla-core==0.5.2+v0.1.0.ppu2.2.0" && \
+    python3 -c "import importlib.metadata as im; \
+assert im.version('flash-linear-attention') == '0.5.2+v0.1.0.ppu2.2.0', im.version('flash-linear-attention'); \
+assert im.version('fla-core') == '0.5.2+v0.1.0.ppu2.2.0', im.version('fla-core')" && \
+    python3 -c "import fla.ops.kda.chunk_intra_token_parallel; print('fla art-source platform 0.5.2 (shell+core) OK')"
 
 # KDA hoist (upstream PR #1108): hoist the BK constexpr out of the @triton.jit
-# kernel body into the signature. The platform fork does NOT carry this fix
-# (verified: BK constexpr still in the kernel body at v0.5.2 branch HEAD),
-# and the patch applies cleanly against the fork tree (dry-run checked).
+# kernel body into the signature. The art-source 0.5.2 build does NOT carry
+# this fix (verified: BK constexpr still in the kernel body of the ppu2.2.0
+# fla-core wheel), and the patch applies cleanly (dry-run checked).
 COPY docker/ppu_patch_sglang_0.5.22/fla-0001-kda-hoist-next-power-of-2.patch \
      /tmp/fla_kda_hoist_next_power_of_2.patch
 
@@ -441,11 +438,11 @@ ENV HF_HUB_DISABLE_XET=1 \
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1
 
 RUN printf '%s\n' \
-    "image=miles-sail v0.1.3 (this repo build context; sglang source-tree install from sglang-for-sail + fla platform fork; zero wheel files in build context)" \
+    "image=miles-sail v0.1.3 (this repo build context; sglang source-tree install from sglang-for-sail + fla art-source platform build; zero wheel files in build context)" \
     "base=pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001" \
     "miles_branch=${MILES_BRANCH} (this repo's v0.1.3 branch COPY'd at build time; in-tree adaptation: GPU id sortkey; colocate IPC barrier native upstream) + megatron @${MEGATRON_COMMIT} (radixark fork, editable) + ray 2.58.0" \
     "sglang=0.5.22 (release/v0.5.22 @$(cat /tmp/sglang-commit.txt); runtime-port merge patch 190 files + colocate graph recapture patch; source-tree install)" \
-    "fla=0.5.2 platform fork @${FLA_COMMIT} (+KDA hoist); pla=1.0.0 (linear-attn kernels)" \
+    "fla=0.5.2+v0.1.0.ppu2.2.0 (art-source platform build, shell + fla-core split; +KDA hoist); pla=1.0.0 (linear-attn kernels)" \
     "platform-kernels=TE 2.16 apex 24.4.1 flash-attn 2.8.2/3.0.0 tilelang 0.1.8 tile_kernels 1.0.0 deep_ep 2.2.0 mooncake 0.3.12.post1 (art-source platform builds)" \
     "sglang-kernel=0.4.6.post1 (SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1) + sglang-router 0.3.2 OFFICIAL miles build (57-field GenerateRequest) + sgl-model-gateway" \
     "patches=is_ppu compat shim + gpu-id sortkey patch; transformers 5.19.0 nvidia-modelopt 0.47.0 torchtitan v0.3.0 torchdata 0.11.0 pyarrow 25.0.1 causal-conv1d 1.7.0 fake_int4_quant_cuda (source) TMS 0.0.9.post1" \
@@ -527,9 +524,10 @@ assert "/end_weight_update" in paths, "miles route /end_weight_update missing"
 from sglang.srt.utils import is_ppu  # noqa: F401
 assert callable(is_ppu), "is_ppu compat shim missing"
 
-# fla (platform fork + KDA hoist)
+# fla (art-source platform build + KDA hoist; the split shell overwrites fla/__init__.py)
 import fla
-assert md.version("flash-linear-attention") == "0.5.2", md.version("flash-linear-attention")
+assert md.version("flash-linear-attention") == "0.5.2+v0.1.0.ppu2.2.0", md.version("flash-linear-attention")
+assert md.version("fla-core") == "0.5.2+v0.1.0.ppu2.2.0", md.version("fla-core")
 from fla.ops.kda import chunk_kda  # noqa: F401
 from fla.ops.kda.gate import fused_kda_gate  # noqa: F401
 from fla.modules import FusedRMSNormGated, ShortConvolution  # noqa: F401
@@ -587,7 +585,7 @@ print(f"megatron-core           {md.version('megatron-core')}")
 print(f"transformer_engine      {md.version('transformer_engine')}")
 print(f"apex                    {md.version('apex')}")
 print(f"flash-attn              {md.version('flash-attn')} + flash-attn-3 {md.version('flash-attn-3')} (dual)")
-print(f"flash-linear-attention  {md.version('flash-linear-attention')} (platform fork, + KDA hoist)")
+print(f"flash-linear-attention  {md.version('flash-linear-attention')} (art-source platform build, + KDA hoist)")
 print(f"pla                     {md.version('pla')} (linear-attn kernels, sglang rollout)")
 print(f"tile_kernels            {md.version('tile_kernels')} (DeepSeek-V4 qat)")
 print(f"deep_ep                 {md.version('deep_ep')}")
