@@ -328,6 +328,11 @@ RUN grep -v ring_flash_attn /root/miles/requirements.txt > /tmp/requirements.txt
 
 RUN pip install -e /root/miles --no-deps -c /tmp/miles_constraints.txt
 
+# uv: tests/ci/reconcile_dependencies.py shells out to uv whenever the image
+# pins cuDNN; CPU CI runners get it from astral-sh/setup-uv, so the in-image
+# tests/ci run needs it baked here (0.13.10 verified against the resolver test).
+RUN pip install "uv==0.13.10" && uv --version
+
 # fake_int4_quant_cuda (int4 QAT export kernel): the official release wheel is
 # a CUDA build, so build the same source (miles int4_fake) with the platform SDK
 # nvcc (device-less build falls back to TORCH_CUDA_ARCH_LIST).
