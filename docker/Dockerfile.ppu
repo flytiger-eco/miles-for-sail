@@ -142,9 +142,9 @@ RUN pip install --no-deps "tile_kernels==1.0.0" && \
 # sglang-router + sgl-model-gateway
 ARG MILES_WHEELS_URL=https://github.com/radixark/miles-wheels/releases/download/cu130-torch214-x86_64
 ARG SGL_ROUTER_WHL=sglang_router-0.3.2-cp38-abi3-manylinux_2_39_x86_64.whl
-ARG SGL_ROUTER_SHA256=9698944a41e095cf2789b07de30813e928a0818fe283346e0a8949ab4bd02b5b
+ARG SGL_ROUTER_SHA256=92739abe3f2c894552aa530b287ee4a5ace6a3c30a4b4b903f46c37da4a3feed
 ARG SGL_GATEWAY_TGZ=sgl-model-gateway-linux-x86_64.tar.gz
-ARG SGL_GATEWAY_SHA256=0a6b47fe8511ed87902e8da511b283ef25ea954360551203403fb1b19f806481
+ARG SGL_GATEWAY_SHA256=d733247577614faff093e2746ee74bd3b09bcdbdcef9f3a9499460391d6d82e9
 # NOTE: --http1.1 + speed guards: in-network github CDN transfers die with
 # HTTP/2 PROTOCOL_ERROR (not covered by --retry) or stall with zero throughput
 # -- the guards turn both into a fast failure instead of a hang.
@@ -159,7 +159,7 @@ RUN set -e && mkdir -p /tmp/wheels && cd /tmp/wheels && \
     tar xzf /tmp/wheels/${SGL_GATEWAY_TGZ} -C /usr/local/bin/ && \
     chmod +x /usr/local/bin/sgl-model-gateway && \
     python3 -c "import importlib.metadata as im; v = im.version('sglang-router'); assert v == '0.3.2', v" && \
-    python3 -c "import glob, os, sglang_router; so = glob.glob(os.path.dirname(sglang_router.__file__) + '/*.so'); b = open(so[0], 'rb').read(); assert b'return_routed_experts' in b and b'struct GenerateRequest with 53 elements' in b, 'router lacks return_routed_experts'; print('official sglang-router OK (53-field GenerateRequest)')" && \
+    python3 -c "import glob, os, sglang_router; so = glob.glob(os.path.dirname(sglang_router.__file__) + '/*.so'); b = open(so[0], 'rb').read(); assert b'return_routed_experts' in b and b'struct GenerateRequest with 57 elements' in b, 'router lacks return_routed_experts'; print('official sglang-router OK (57-field GenerateRequest)')" && \
     sgl-model-gateway --version && \
     rm -rf /tmp/wheels
 
@@ -441,7 +441,7 @@ RUN printf '%s\n' \
     "sglang=0.5.22 (release/v0.5.22 @$(cat /tmp/sglang-commit.txt); runtime-port merge patch 190 files + colocate graph recapture patch; source-tree install)" \
     "fla=0.5.2 platform fork @${FLA_COMMIT} (+KDA hoist); pla=1.0.0 (linear-attn kernels)" \
     "platform-kernels=TE 2.16 apex 24.4.1 flash-attn 2.8.2/3.0.0 tilelang 0.1.8 tile_kernels 1.0.0 deep_ep 2.2.0 mooncake 0.3.12.post1 (art-source platform builds)" \
-    "sglang-kernel=0.4.6.post1 (SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1) + sglang-router 0.3.2 OFFICIAL miles build (53-field GenerateRequest) + sgl-model-gateway" \
+    "sglang-kernel=0.4.6.post1 (SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1) + sglang-router 0.3.2 OFFICIAL miles build (57-field GenerateRequest) + sgl-model-gateway" \
     "patches=is_ppu compat shim + gpu-id sortkey patch; transformers 5.19.0 nvidia-modelopt 0.47.0 torchtitan v0.3.0 torchdata 0.11.0 pyarrow 25.0.1 causal-conv1d 1.7.0 fake_int4_quant_cuda (source) TMS 0.0.9.post1" \
     > /etc/miles-release
 
@@ -552,7 +552,7 @@ _barrier_calls = [
 ]
 assert _barrier_calls, "miles: dist.barrier(group=self._ipc_gather_group) not found in cuda_ipc.py"
 
-# official router assert (53-field GenerateRequest)
+# official router assert (57-field GenerateRequest)
 import glob
 import os
 import sglang_router
@@ -561,7 +561,7 @@ _rso = glob.glob(os.path.join(os.path.dirname(sglang_router.__file__), "*.so"))
 assert _rso, "sglang_router rust extension missing"
 _rbin = pathlib.Path(_rso[0]).read_bytes()
 assert b"return_routed_experts" in _rbin, "router GenerateRequest lacks return_routed_experts"
-assert b"struct GenerateRequest with 53 elements" in _rbin, "router GenerateRequest is not the 53-field miles build"
+assert b"struct GenerateRequest with 57 elements" in _rbin, "router GenerateRequest is not the 57-field miles build"
 assert shutil.which("sgl-model-gateway") is not None, "sgl-model-gateway missing"
 
 # extras
@@ -594,7 +594,7 @@ print(f"transformers            {transformers.__version__}")
 print(f"miles                   {md.version('miles')} ({pathlib.Path('/root/miles').resolve()})")
 print("miles in-tree adaptations: GPU id sortkey (ray string ids); colocate IPC barrier native upstream")
 print(f"mooncake                {md.version('mooncake-transfer-engine')} (transfer engine; master binary ready)")
-print(f"sglang-router           {md.version('sglang-router')} (OFFICIAL miles build, 53-field GenerateRequest w/ return_routed_experts) + sgl-model-gateway")
+print(f"sglang-router           {md.version('sglang-router')} (OFFICIAL miles build, 57-field GenerateRequest w/ return_routed_experts) + sgl-model-gateway")
 print(f"fake_int4_quant_cuda    {md.version('fake_int4_quant_cuda')} (official source, platform nvcc build)")
 print(f"torchtitan              {md.version('torchtitan')} + spmd_types {md.version('spmd_types')} + tyro {md.version('tyro')} + torchdata {md.version('torchdata')}")
 print(f"causal-conv1d           {md.version('causal-conv1d')} + mamba-ssm {md.version('mamba-ssm')} + fast-hadamard {md.version('fast-hadamard-transform')}")
