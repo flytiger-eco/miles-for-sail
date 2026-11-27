@@ -1,0 +1,285 @@
+# Miles-for-SAIL v0.2.0 PPU image (build context: repository root)
+
+ARG PPU_BASE_IMAGE=pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.1-2.13.0-ubuntu24.04-cuda13.0-py312-20261103
+FROM ${PPU_BASE_IMAGE} AS sources
+
+WORKDIR /root/
+
+# =====================================================================
+# Step 1: Build environment and release lock
+# =====================================================================
+
+ENV GIT_HTTP_LOW_SPEED_LIMIT=1024 GIT_HTTP_LOW_SPEED_TIME=60
+RUN git config --global http.version HTTP/1.1
+COPY release-lock.json /tmp/miles-release-lock.json
+
+# =====================================================================
+# Step 2: SGLang source and PPU patch
+# =====================================================================
+
+# flytiger-eco/sglang-for-sail 0.5.23+v0.1.0 (ba98b340) is a CD publication tag
+# (workflows/docker/scripts, no source); it publishes the matching SDK 2.2.1
+# kernel used below. The source port pins dev commit 651bc4dd (sglang-kernel
+# 0.4.10) on that mirror; baseline 297e54fd is sgl-project/sglang v0.5.23.
+COPY docker/gen_sglang_ppu_port.sh /tmp/gen_sglang_ppu_port.sh
+RUN set -eu; \
+    sglang_repo=$(python3 -c 'import json; print(json.load(open("/tmp/miles-release-lock.json"))["sglang_repo"])'); \
+    sglang_commit=$(python3 -c 'import json; print(json.load(open("/tmp/miles-release-lock.json"))["sglang_commit"])'); \
+    git init /sgl-workspace/sglang; \
+    cd /sgl-workspace/sglang; \
+    git remote add origin "https://github.com/${sglang_repo}.git"; \
+    git fetch --depth 1 origin "${sglang_commit}"; \
+    git checkout --detach FETCH_HEAD; \
+    test "$(git rev-parse HEAD)" = "${sglang_commit}"; \
+    bash /tmp/gen_sglang_ppu_port.sh /sgl-workspace/sglang 297e54fd105e974cdf401e5b4d20253a22c16f90 651bc4dd03ae91e2739b14a8657a2b20c52df350
+
+# =====================================================================
+# Step 3: Megatron-LM source and submodules
+# =====================================================================
+
+RUN set -eu; \
+    megatron_repo=$(python3 -c 'import json; print(json.load(open("/tmp/miles-release-lock.json"))["megatron_repo"])'); \
+    megatron_branch=$(python3 -c 'import json; print(json.load(open("/tmp/miles-release-lock.json"))["megatron_branch"])'); \
+    megatron_commit=$(python3 -c 'import json; print(json.load(open("/tmp/miles-release-lock.json"))["megatron_commit"])'); \
+    git clone --branch "${megatron_branch}" --single-branch --depth 1 --no-checkout \
+        "https://github.com/${megatron_repo}.git" /root/Megatron-LM; \
+    cd /root/Megatron-LM; \
+    git fetch --depth 1 origin "${megatron_commit}"; \
+    git checkout --detach FETCH_HEAD; \
+    test "$(git rev-parse HEAD)" = "${megatron_commit}"; \
+    git submodule update --init --recursive
+
+FROM sources AS runtime
+
+# The platform sdist builds against system setuptools; packaging must be new
+# enough for canonicalize_version(strip_trailing_zero=...) before installing it.
+RUN --mount=type=cache,id=miles-v020-ppu-pip,target=/root/.cache/pip \
+    pip install --index-url https://pypi.org/simple 'packaging>=24.2' pybind11 'setuptools-scm>=8.0'
+
+RUN --mount=type=cache,id=miles-v020-ppu-pip,target=/root/.cache/pip \
+    mkdir -p /tmp/ppu-wheels && \
+    pip install --no-deps --index-url https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple \
+        'sglang_kernel==0.4.10+v0.1.0.ppu2.2.1' && \
+    python3 -c 'from importlib.metadata import version; assert version("sglang-kernel") == "0.4.10+v0.1.0.ppu2.2.1"'
+
+# =====================================================================
+# Step 4: Install patched source trees
+# =====================================================================
+
+RUN SGLANG_BUILD_RUST_EXTS=none pip install --no-build-isolation --no-deps -e /sgl-workspace/sglang/python && \
+    pip install --no-build-isolation --no-deps -e /sgl-workspace/sglang/radix_transfer_plugins && \
+    pip install --no-build-isolation --no-deps -e /root/Megatron-LM && \
+    python3 -c 'from importlib.metadata import version; assert version("torch").startswith("2.13.0+") and ".ppu" in version("torch"), version("torch")'
+
+# =====================================================================
+# Step 5: Python runtime dependencies
+# =====================================================================
+
+COPY requirements.txt /tmp/miles-upstream-requirements.txt
+RUN --mount=type=cache,id=miles-v020-ppu-pip,target=/root/.cache/pip \
+    set -eu; \
+    python3 -c 'from importlib.metadata import version; print(*(f"{package}=={version(package)}" for package in ("torch", "torchvision")), sep="\n")' > /tmp/ppu-runtime-constraints.txt && \
+    grep -Ev '^(ring_flash_attn|sglang-router|torchft-nightly)([[:space:];>=<]|$)' /tmp/miles-upstream-requirements.txt > /tmp/miles-python-requirements.txt && \
+    pip install --index-url https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple --constraint /tmp/ppu-runtime-constraints.txt \
+        -r /tmp/miles-python-requirements.txt 'datasets>=3.6,<4.8' 'numpy<1.28' \
+        'pyarrow @ https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/packages/packages/60/c9/711ca85d79f1ec98f29a5eae2b051e25b4ecec5de3e3c0e2d5c5dcb15664/pyarrow-25.0.1-cp312-cp312-manylinux_2_28_x86_64.whl#sha256=5389cdf79447ed1515c9e31620e6e1e2302249564d603f2ad727d4f6d313e4c3' \
+        'onnx @ https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/packages/packages/87/56/21509a657f9a73ab0ca307d325043f49ca6c4ff6bf79edeb9e159190d44d/onnx-1.23.2-cp312-abi3-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl#sha256=7abf381d278f31ac62487fddedc9dd42da842dce94d5d43536836ee3efdf4a2b' \
+        'blobfile==3.0.0' 'openai==2.8.0' 'python-dateutil<3' 'tokenizers==0.23.2' \
+        'soundfile==0.13.1' 'six>=1.17.0' 'compressed-tensors==0.18.0' \
+        anthropic build easydict einops fastapi gguf interegular msgspec partial-json-parser \
+        pyzmq sentencepiece setproctitle tabulate tiktoken uvloop watchfiles && \
+    python3 -c 'import einops, fastapi, msgspec, orjson, setproctitle, zmq; import radix_transfer_plugins.stashes.token_output'
+
+# =====================================================================
+# Step 6: Official Miles Router and Gateway release artifacts
+# =====================================================================
+
+RUN set -eu; \
+    release_url=https://github.com/radixark/miles-wheels/releases/download/cu130-torch214-x86_64; \
+    router_wheel=sglang_router-0.3.2-cp38-abi3-manylinux_2_39_x86_64.whl; \
+    gateway_tarball=sgl-model-gateway-linux-x86_64.tar.gz; \
+    mkdir -p /tmp/miles-release-wheels; \
+    cd /tmp/miles-release-wheels; \
+    for asset in "$router_wheel" "$gateway_tarball"; do \
+        curl -fSL --http1.1 --retry 3 --speed-limit 4096 --speed-time 60 -o "$asset" "$release_url/$asset"; \
+    done; \
+    printf '%s  %s\n' 905677d2038b20e6b888e81e9371edc06201f993cd5c03b95cbd3c9b902e5ef2 "$router_wheel" \
+        c6e16804a4c6c21faa1a324f4e8a8ee5ab2e387557222a877504f2ddeb4063e9 "$gateway_tarball" | sha256sum -c -; \
+    pip install --force-reinstall --no-deps "./$router_wheel"; \
+    tar -xzf "$gateway_tarball" -C /usr/local/bin/; \
+    chmod +x /usr/local/bin/sgl-model-gateway; \
+    sgl-model-gateway --version
+
+# =====================================================================
+# Step 7: FlashInfer and Sailify JIT runtime for PPU
+# =====================================================================
+
+ARG FLASHINFER_PPU_URL=https://pkg.flytiger-eco.com/artifactory/pypi_generic/flashinfer_python/0.6.18+v0.2.0.ppu2.2.0/flashinfer_python-0.6.18+cu130torch2.13.0ubuntu2404oe-cp312-cp312-linux_x86_64.whl
+ARG SAILIFY_PPU_URL=https://pkg.flytiger-eco.com/artifactory/pypi_generic/sailify/1.0.0+ppu2.2.1/sailify-1.0.0+cu130ubuntu2404oe-cp312-cp312-linux_x86_64.whl
+ARG SAILIFY_PPU_RESOLVE=
+RUN --mount=type=cache,id=miles-v020-ppu-pip,target=/root/.cache/pip set -eu; \
+    flashinfer_wheel=flashinfer_python-0.6.18+cu130torch2.13.0ubuntu2404oe-cp312-cp312-linux_x86_64.whl; \
+    sailify_wheel=sailify-1.0.0+cu130ubuntu2404oe-cp312-cp312-linux_x86_64.whl; \
+    cd /tmp/ppu-wheels; \
+    curl -fsSL -o "$flashinfer_wheel" "$FLASHINFER_PPU_URL"; \
+    if [ -n "$SAILIFY_PPU_RESOLVE" ]; then \
+        set -- --resolve "$SAILIFY_PPU_RESOLVE"; \
+    else \
+        set --; \
+    fi; \
+    curl -fsSL "$@" -o "$sailify_wheel" "$SAILIFY_PPU_URL"; \
+    printf '%s  %s\n' aace72abfda017f583044100ee9f93b7d0dc455ad7b70eece34d97211ff4f783 "$flashinfer_wheel" \
+        76b1afc435a46c7db103fcef46d2949f06bb3e5a434c5de7cfb8dc663e7c597f "$sailify_wheel" | sha256sum -c -; \
+    pip install --no-deps "./$flashinfer_wheel" "./$sailify_wheel"; \
+    pip install --no-deps --index-url https://pypi.org/simple 'apache-tvm-ffi==0.1.11' nvidia-ml-py; \
+    python3 -c 'from importlib.metadata import version; from inspect import signature; from tvm_ffi.utils.kwargs_wrapper import make_kwargs_wrapper; assert version("flashinfer-python") == "0.6.18+v0.2.0.ppu2.2.0"; assert "map_dataclass_to_tuple" in signature(make_kwargs_wrapper).parameters'
+
+# =====================================================================
+# Step 8: Build torch_memory_saver from the upstream Git revision
+# =====================================================================
+
+RUN git init -q /tmp/torch_memory_saver && \
+    git -C /tmp/torch_memory_saver remote add origin https://github.com/fzyzcjy/torch_memory_saver.git && \
+    git -C /tmp/torch_memory_saver fetch --depth 1 origin 118b09b3bc7b0cf386745db1eac2601d4aa7e681 && \
+    git -C /tmp/torch_memory_saver checkout --detach 118b09b3bc7b0cf386745db1eac2601d4aa7e681 && \
+    TMS_CUDA_MAJOR=$(python3 -c 'import torch; print(torch.version.cuda.split(".")[0])') \
+    pip install --no-deps --no-build-isolation --no-cache-dir \
+        /tmp/torch_memory_saver && \
+    python3 -c 'from pathlib import Path; from torch_memory_saver.utils import get_binary_path_from_package; assert Path(get_binary_path_from_package("torch_memory_saver_hook_mode_preload")).is_file()'
+
+# =====================================================================
+# Step 9: Install the original training bridges from Git
+# =====================================================================
+
+RUN --mount=type=cache,id=miles-v020-ppu-pip,target=/root/.cache/pip \
+    git init -q /tmp/mbridge && \
+    git -C /tmp/mbridge remote add origin https://github.com/ISEEKYAN/mbridge.git && \
+    git -C /tmp/mbridge fetch --depth 1 origin 89eb10887887bc74853f89a4de258c0702932a1c && \
+    git -C /tmp/mbridge checkout --detach 89eb10887887bc74853f89a4de258c0702932a1c && \
+    pip install --no-deps --index-url https://pypi.org/simple /tmp/mbridge
+RUN pip install --no-deps --no-build-isolation \
+    git+https://github.com/radixark/Megatron-Bridge.git@a0c6d6e09b0bd4d208c2d936608319d5ab456d87
+
+# =====================================================================
+# Step 10: Install the original Git-pinned training backends
+# =====================================================================
+
+ARG TORCHTITAN_REPO=pytorch/torchtitan
+ARG TORCHTITAN_COMMIT=45e33cd413b64cb37a7840cfd3c9765d3c639ae1
+RUN --mount=type=cache,id=miles-v020-ppu-pip,target=/root/.cache/pip \
+    pip install --index-url https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple --constraint /tmp/ppu-runtime-constraints.txt \
+        git+https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git@v0.3.0
+RUN --mount=type=cache,id=miles-v020-ppu-pip,target=/root/.cache/pip \
+    git clone "https://github.com/${TORCHTITAN_REPO}.git" /root/torchtitan && \
+    git -C /root/torchtitan checkout --detach "${TORCHTITAN_COMMIT}" && \
+    pip install --index-url https://pypi.org/simple --no-deps -e /root/torchtitan && \
+    pip install --index-url https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple --constraint /tmp/ppu-runtime-constraints.txt \
+        'spmd_types==0.3.1' 'torch_remat==0.2.2' 'torch_checkpointing==0.1.1' 'grain==0.2.18' && \
+    pip install --no-deps --index-url https://pypi.org/simple 'attn-gym==0.0.17'
+
+ARG PPU_PIP_INDEX=https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple
+RUN bash -e -o pipefail -c 'source "${PPU_SDK:-/usr/local/PPU_SDK}/envsetup.sh" ppu; \
+    set -u; cd /tmp/ppu-wheels; mkdir -p /tmp/ppu-built-wheels; \
+    for spec in \
+        "cuda-bindings cuda_bindings 13.0.0+v0.1.0.ppu2.2.0 ff4f396094636d3cb3a7d417b5c40eff9f2539de784bd54652f279b117f334a9" \
+        "cuda-python cuda_python 13.0.0+v0.1.0.ppu2.2.0 f9f60a90be2555b8f7963dd4e792ab592a0e63845b96f6c041ee2a7c03692e10" \
+        "deep-ep deep_ep 2.2.1+v0.1.0.ppu2.2.0 06b86361327dad87c11b6d06f42363fb20eec862b4959a5fd873f13697cdea96"; do \
+        read -r project package version digest <<< "$spec"; \
+        file="$package-$version.tar.gz"; \
+        curl -fsSL -o "$file" "${PPU_PIP_INDEX%/simple}/$project/$version/$file"; \
+        printf "%s  %s\n" "$digest" "$file" | sha256sum -c -; \
+        MAX_JOBS=8 python3 -m pip wheel --no-cache-dir --no-deps --no-build-isolation \
+            --wheel-dir /tmp/ppu-built-wheels "./$file"; \
+    done; \
+    python3 -m pip install --no-index --no-deps /tmp/ppu-built-wheels/*.whl'
+
+RUN --mount=type=cache,id=miles-v020-ppu-pip,target=/root/.cache/pip set -eu; \
+    pip install --no-deps --index-url "${PPU_PIP_INDEX}" 'transformer_engine==2.18.0+v0.2.0.ppu2.2.0'; \
+    python3 -c 'from importlib.metadata import version; assert version("transformer-engine") == "2.18.0+v0.2.0.ppu2.2.0"'
+
+# Step 11: Additional SGLang and TE runtime dependencies.
+RUN --mount=type=cache,id=miles-v020-ppu-pip,target=/root/.cache/pip \
+    pip install --index-url "${PPU_PIP_INDEX}" --constraint /tmp/ppu-runtime-constraints.txt \
+        IPython 'numba==0.65.1' 'tml-renderers==0.1.0' nvdlfw-inspect
+
+# Qwen rollout uses the PPU GEMM tuner and linear-attention kernels.
+RUN --mount=type=cache,id=miles-v020-ppu-pip,target=/root/.cache/pip \
+    bash -e -o pipefail -c 'source "${PPU_SDK:-/usr/local/PPU_SDK}/envsetup.sh" ppu; \
+        MAX_JOBS=8 python3 -m pip install --no-build-isolation \
+            --index-url "$PPU_PIP_INDEX" --constraint /tmp/ppu-runtime-constraints.txt \
+            "deep-gemm==1.1.0+v1.1.0.ppu2.2.1" "pla==1.0.0+v0.1.0.ppu2.2.0" \
+            "flash-linear-attention==0.5.2+v0.1.0.ppu2.2.1" "xgrammar==0.2.7"'
+
+# SGLang's quantization registry imports ACExt even for BF16 models.
+RUN --mount=type=cache,id=miles-v020-ppu-pip,target=/root/.cache/pip \
+    bash -e -o pipefail -c 'source "${PPU_SDK:-/usr/local/PPU_SDK}/envsetup.sh" ppu; \
+        MAX_JOBS=8 python3 -m pip install --no-build-isolation \
+            --index-url "$PPU_PIP_INDEX" --constraint /tmp/ppu-runtime-constraints.txt \
+            "acext==1.1.0+v0.2.0.ppu2.2.0"; \
+        pip install tilelang==0.1.12+v0.2.0.ppu2.2.1 -i https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple; \
+        python3 -m pip install --no-deps --index-url "$PPU_PIP_INDEX" "tile_kernels==1.0.0"'
+
+# TileLang 0.1.12 supports TVM-FFI 0.1.10–0.1.11. The PPU FlashInfer JIT
+# needs make_kwargs_wrapper(map_dataclass_to_tuple=...) from 0.1.11.
+RUN --mount=type=cache,id=miles-v020-ppu-pip,target=/root/.cache/pip \
+    pip install --no-deps --index-url "$PPU_PIP_INDEX" 'apache-tvm-ffi==0.1.11' && \
+    python3 -c 'from inspect import signature; from tvm_ffi.utils.kwargs_wrapper import make_kwargs_wrapper; assert "map_dataclass_to_tuple" in signature(make_kwargs_wrapper).parameters'
+
+# =====================================================================
+# cuda-bindings is installed without dependencies above.
+RUN --mount=type=cache,id=miles-v020-ppu-pip,target=/root/.cache/pip \
+    pip install --index-url "$PPU_PIP_INDEX" "cuda-pathfinder==1.9.1"
+
+# =====================================================================
+
+# Step 12: Install Miles from the build context
+# =====================================================================
+
+COPY . /root/miles
+RUN pip install --no-build-isolation --no-deps -e /root/miles
+
+# Step 13: CI resolver and Miles optional kernel argument support.
+RUN --mount=type=cache,id=miles-v020-ppu-pip,target=/root/.cache/pip \
+    python3 -m pip install --index-url "$PPU_PIP_INDEX" 'uv==0.13.9' 'deepseek-recipe==0.2.0' && \
+    uv --version
+
+# Match the miles-ext-kernels submodule pinned by Miles v0.2.0.
+ARG MILES_EXT_KERNELS_COMMIT=34da9a8da93b5fe9c7b67d25582bbaf6ddb3653a
+RUN git init -q /opt/miles-ext-kernels && \
+    git -C /opt/miles-ext-kernels remote add origin https://github.com/radixark/miles-ext-kernels.git && \
+    git -C /opt/miles-ext-kernels fetch --depth 1 origin "${MILES_EXT_KERNELS_COMMIT}" && \
+    git -C /opt/miles-ext-kernels checkout --detach FETCH_HEAD && \
+    test "$(git -C /opt/miles-ext-kernels rev-parse HEAD)" = "${MILES_EXT_KERNELS_COMMIT}"
+ENV PYTHONPATH=/opt/miles-ext-kernels:$PYTHONPATH
+RUN python3 -c 'import miles_ext_kernels; assert callable(miles_ext_kernels.add_arguments)'
+
+# PPU attention, transfer, and training kernels for the release runtime.
+RUN --mount=type=cache,id=miles-v020-ppu-pip,target=/root/.cache/pip \
+    python3 -m pip install --no-build-isolation --index-url "$PPU_PIP_INDEX" \
+        --constraint /tmp/ppu-runtime-constraints.txt \
+        'flash-attn==2.8.2+v0.2.0.ppu2.2.1' 'flash-attn-3==3.0.0+v0.2.0.ppu2.2.1' \
+        'flash-mla==2.1.0+v1.1.0.ppu2.2.1' 'apex==24.4.1+v0.1.0.ppu2.2.0' \
+        'causal-conv1d==1.7.0+v0.1.0.ppu2.2.0' 'mamba-ssm==2.3.1+v0.1.0.ppu2.2.0' \
+        'fast-hadamard-transform==1.1.0.post2+v0.1.0.ppu2.2.0' 'nvidia-modelopt[torch]==0.47.0'
+
+# The FlyTiger sdist emits a wheel named mooncake-transfer-engine in its metadata.
+# Rebuild the index artifact on each uncached layer to avoid pip rejecting its cached wheel.
+RUN python3 -m pip install --no-cache-dir --no-build-isolation --index-url "$PPU_PIP_INDEX" \
+    --constraint /tmp/ppu-runtime-constraints.txt 'mooncake==0.3.12.post1+v0.1.0.ppu2.2.0'
+
+# Apply the KDA fix shipped in the v0.2.0 source tree.
+RUN fla_dir=$(python3 -c 'import importlib.util; print(importlib.util.find_spec("fla").submodule_search_locations[0])') && \
+    patch --fuzz=0 -p1 -d "$fla_dir" < /root/miles/docker/patch/fla_kda_hoist_next_power_of_2.patch
+
+# Build the in-tree INT4 kernel against the installed platform torch and SDK.
+RUN bash -e -c 'source "${PPU_SDK:-/usr/local/PPU_SDK}/envsetup.sh" ppu; \
+    TORCH_CUDA_ARCH_LIST=8.0 MAX_JOBS=4 python3 -m pip install --no-build-isolation --no-deps \
+        /root/miles/miles/kernels/quant/int4_fake'
+
+# Let hggcGraphLaunch tolerate the CUDA-graph memory remap, so EAGLE/MTP
+# graph replay works after colocate weight updates (same as the v0.1.3
+# Dockerfile; without it the first EAGLE draft-extend graph replay after
+# update_weights + memory resume segfaults, verified on 810E 2026-11-26).
+ENV HGGC_DEVICE_GRAPH=2
+
+WORKDIR /root/miles

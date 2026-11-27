@@ -88,7 +88,7 @@ class TestSharedStandaloneConfiguration:
     @pytest.mark.parametrize("role", ["actor", "critic"])
     @pytest.mark.parametrize("offload", [False, True])
     def test_real_shared_parser_builds_the_requested_typed_trainer(
-        self, monkeypatch: pytest.MonkeyPatch, role: str, offload: bool
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, role: str, offload: bool
     ) -> None:
         """Standalone parsing accepts the requested role only with supported training options."""
         monkeypatch.setenv("WORLD_SIZE", "1")
@@ -96,10 +96,13 @@ class TestSharedStandaloneConfiguration:
         monkeypatch.setenv("RANK", "0")
         monkeypatch.setenv("LOCAL_RANK", "0")
         monkeypatch.setenv("MILES_SCRIPT_ENV_REPORT", "")
+        (tmp_path / "config.json").write_text('{"model_type":"gpt2","n_embd":128,"n_head":2,"n_layer":2}')
         argv = [
             "worker",
             "--script-hf-checkpoint",
-            "/model",
+            str(tmp_path),
+            "--script-ref-load",
+            str(tmp_path),
             "--script-token-ids-file",
             "/tokens",
             "--script-role",
@@ -131,6 +134,6 @@ class TestSharedStandaloneConfiguration:
         assert inputs.trainer.backend.micro_batch_size == 1
         assert not inputs.trainer.offload_train
         assert inputs.script.role == role
-        assert inputs.ckpt_load_config.load == "/model"
+        assert inputs.ckpt_load_config.load == str(tmp_path)
         assert not inputs.ckpt_load_config.resume_from_ckpt
         assert sys.argv is argv
