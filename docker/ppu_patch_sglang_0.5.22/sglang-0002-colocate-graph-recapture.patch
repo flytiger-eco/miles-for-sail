@@ -1,0 +1,87 @@
+# Copyright © 2026 Zhejiang Runhe Cloud Intelligence Technology Co., Ltd
+
+--- a/python/sglang/srt/managers/scheduler_components/weight_updater.py
++++ b/python/sglang/srt/managers/scheduler_components/weight_updater.py
+@@ -132,6 +132,9 @@
+     _session: Optional[_WeightUpdateSession] = None
+     _lora_stash: Dict[str, Dict[str, torch.Tensor]] = field(default_factory=dict)
+     _lora_applied_names: Dict[str, frozenset] = field(default_factory=dict)
++    # MILES sglang-0002: weights were updated since the decode cuda graphs
++    # were last captured (drives the recapture on memory-occupation resume).
++    _weights_dirty: bool = False
+     tp_cpu_group: Any = field(init=False)
+ 
+     def __post_init__(self) -> None:
+@@ -168,6 +171,9 @@
+         return success, message
+ 
+     def record_weight_version_after_update(self, weight_version: Optional[str]) -> None:
++        # MILES sglang-0002: any successful weight update may invalidate
++        # decode cuda graphs captured before the current offload cycle.
++        self._weights_dirty = True
+         if self._session is not None:
+             if weight_version is not None:
+                 self._session = msgspec.structs.replace(
+@@ -541,6 +547,10 @@
+         if tags is None or len(tags) == 0:
+             tags = GPU_MEMORY_ALL_TYPES
+ 
++        # MILES sglang-0002: start of a new offload cycle; graphs captured
++        # before this cycle are what matter once weights update.
++        self._weights_dirty = False
++
+         if GPU_MEMORY_TYPE_KV_CACHE in tags:
+             if scheduler is not None:
+                 if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
+@@ -587,6 +597,10 @@
+         if tags is None or len(tags) == 0:
+             tags = GPU_MEMORY_ALL_TYPES
+ 
++        # MILES sglang-0002: snapshot whether the cuda-graph pool was offloaded
++        # in this cycle (offload_tags is cleared just below).
++        graph_was_paused = GPU_MEMORY_TYPE_CUDA_GRAPH in self.offload_tags
++
+         for tag in tags:
+             self.offload_tags.remove(tag)
+ 
+@@ -620,6 +634,40 @@
+                     if queue is not None:
+                         queue.resume_memory_occupation()
+ 
++        # MILES sglang-0002: after a colocate cycle (release -> weight update
++        # -> resume), the pre-cycle decode cuda graphs are stale and segfault
++        # on their first replay (EAGLEDraftCudaGraphRunner replay SIGSEGV
++        # once KV-full retraction dropped decode below graph max bs).
++        # Recapture them here, after all memory pools are resumed.
++        if (
++            GPU_MEMORY_TYPE_CUDA_GRAPH in tags
++            and graph_was_paused
++            and self._weights_dirty
++        ):
++            self._weights_dirty = False
++            # (a) target model graphs (decode + EAGLE target-verify): the
++            # from-disk path's recapture callable == init_decode_cuda_graph.
++            _mr = getattr(self.tp_worker, "model_runner", None)
++            if _mr is not None and callable(
++                getattr(_mr, "recapture_decode_cuda_graph", None)
++            ):
++                logger.info(
++                    "[MILES sglang-0002] recapturing target decode/verify "
++                    "cuda graphs after weight update + memory resume"
++                )
++                _mr.recapture_decode_cuda_graph()
++            # (b) EAGLE draft graphs (draft decode + draft extend): owned by
++            # the draft worker, NOT by the target model_runner.
++            _dw = getattr(self.draft_worker, "_draft_worker", None)
++            if _dw is None:
++                _dw = self.draft_worker
++            if _dw is not None and callable(getattr(_dw, "_capture_cuda_graphs", None)):
++                logger.info(
++                    "[MILES sglang-0002] recapturing EAGLE draft cuda "
++                    "graphs after weight update + memory resume"
++                )
++                _dw._capture_cuda_graphs()
++
+         return ResumeMemoryOccupationReqOutput()
+ 
+     def check_weights(self, recv_req: CheckWeightsReqInput):
