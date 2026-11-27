@@ -103,8 +103,8 @@ RUN set -eu; \
     for asset in "$router_wheel" "$gateway_tarball"; do \
         curl -fSL --http1.1 --retry 3 --speed-limit 4096 --speed-time 60 -o "$asset" "$release_url/$asset"; \
     done; \
-    printf '%s  %s\n' 905677d2038b20e6b888e81e9371edc06201f993cd5c03b95cbd3c9b902e5ef2 "$router_wheel" \
-        c6e16804a4c6c21faa1a324f4e8a8ee5ab2e387557222a877504f2ddeb4063e9 "$gateway_tarball" | sha256sum -c -; \
+    printf '%s  %s\n' 92739abe3f2c894552aa530b287ee4a5ace6a3c30a4b4b903f46c37da4a3feed "$router_wheel" \
+        d733247577614faff093e2746ee74bd3b09bcdbdcef9f3a9499460391d6d82e9 "$gateway_tarball" | sha256sum -c -; \
     pip install --force-reinstall --no-deps "./$router_wheel"; \
     tar -xzf "$gateway_tarball" -C /usr/local/bin/; \
     chmod +x /usr/local/bin/sgl-model-gateway; \
