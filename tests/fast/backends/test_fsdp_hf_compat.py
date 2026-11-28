@@ -460,6 +460,15 @@ _TINY_QWEN3_5_TEXT = dict(
 )
 
 
+def _use_cpu_gated_delta_kernels(monkeypatch):
+    from inspect import unwrap
+
+    from transformers.models.qwen3_5 import modeling_qwen3_5
+
+    for name in ("causal_conv1d_fn", "torch_chunk_gated_delta_rule"):
+        monkeypatch.setattr(modeling_qwen3_5, name, unwrap(getattr(modeling_qwen3_5, name)))
+
+
 def test_gated_deltanet_kernels_receive_packed_boundaries(monkeypatch):
     # HF's Qwen3.5 forwards the padding-free kwargs to its GatedDeltaNet kernels; no patch in between.
     import torch.nn.functional as F
@@ -477,6 +486,7 @@ def test_gated_deltanet_kernels_receive_packed_boundaries(monkeypatch):
         seen["seq_idx"] = seq_idx
         return F.silu(F.conv1d(F.pad(x, (weight.shape[-1] - 1, 0)), weight.unsqueeze(1), bias, groups=x.shape[1]))
 
+    _use_cpu_gated_delta_kernels(monkeypatch)
     chunk = modeling_qwen3_5.torch_chunk_gated_delta_rule
 
     def chunk_rule(*args, cu_seqlens=None, **kwargs):
@@ -502,6 +512,7 @@ def test_qwen3_5_vision_tower_never_sees_language_model_packing_kwargs(monkeypat
     from transformers import AttentionInterface, Qwen3_5Config
     from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
 
+    _use_cpu_gated_delta_kernels(monkeypatch)
     vision_calls = []
 
     def flash_stand_in(module, query, key, value, attention_mask, scaling=None, cu_seq_lens_q=None, **kwargs):

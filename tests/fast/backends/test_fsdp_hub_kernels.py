@@ -461,7 +461,12 @@ def test_hub_kernels_serve_qwen3_5_gated_deltanet_with_the_packed_document_bound
     kernels must be the ones called, receive both boundaries, and keep the arguments they compute on.
     """
     import torch.nn.functional as F
-    from tests.fast.backends.test_fsdp_hf_compat import _TINY_QWEN3_5_TEXT, _adapter, _packed_boundaries
+    from tests.fast.backends.test_fsdp_hf_compat import (
+        _TINY_QWEN3_5_TEXT,
+        _adapter,
+        _packed_boundaries,
+        _use_cpu_gated_delta_kernels,
+    )
     from transformers import Qwen3_5TextConfig
     from transformers.models.qwen3_5 import modeling_qwen3_5
 
@@ -469,6 +474,7 @@ def test_hub_kernels_serve_qwen3_5_gated_deltanet_with_the_packed_document_bound
     for _, name_to_function in _GDN_KERNEL_SLOTS:
         for name in name_to_function:
             monkeypatch.setattr(modeling_qwen3_5, name, getattr(modeling_qwen3_5, name))
+    _use_cpu_gated_delta_kernels(monkeypatch)
     native_chunk = modeling_qwen3_5.torch_chunk_gated_delta_rule
     seen = {}
 

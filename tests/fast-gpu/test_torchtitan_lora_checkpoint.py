@@ -619,6 +619,7 @@ def test_the_actor_starts_after_the_restored_rollout_and_saves_lora_as_adapter_d
             self.saved.append(rollout_id)
 
     trainer = SimpleNamespace(
+        configure_fixed_shape_compile=MagicMock(),
         step=0,
         model_parts=[],
         optimizers=SimpleNamespace(optimizers=[]),
@@ -648,6 +649,7 @@ def test_the_actor_starts_after_the_restored_rollout_and_saves_lora_as_adapter_d
     monkeypatch.setattr(titan_actor, "TorchtitanArgsNamespace", SimpleNamespace)
     args = SimpleNamespace(
         backend=SimpleNamespace(save=save),
+        compile_warmup=False,
         hf_checkpoint="/hf",
         num_rollout=10,
         rollout_batch_size=4,

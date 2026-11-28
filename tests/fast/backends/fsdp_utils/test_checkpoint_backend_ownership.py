@@ -67,7 +67,7 @@ class TestBackendCheckpointOwnership:
             assert set(error.failures) == {0}
             failure, _ = error.failures[0]
             assert type(failure) is AssertionError
-            assert failure.args == ("metadata is None",)
+            assert str(failure).partition(";")[0] == "metadata is None"
             raise
         checkpoint.finalize_load(actor=actor, checkpoint_payload=payload)
 
