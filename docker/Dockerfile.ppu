@@ -238,11 +238,12 @@ RUN --mount=type=cache,id=miles-v020-ppu-pip,target=/root/.cache/pip \
 COPY . /root/miles
 RUN pip install --no-build-isolation --no-deps -e /root/miles
 
-# Step 13: CI resolver, recipe tokenizer, and Tinker gateway client.
+# Step 13: CI resolver, recipe tokenizer, Tinker gateway client, and the
+# Workplace example's argument parser.
 RUN --mount=type=cache,id=miles-v020-ppu-pip,target=/root/.cache/pip \
-    python3 -m pip install --index-url "$PPU_PIP_INDEX" 'uv==0.13.9' 'deepseek-recipe==0.2.0' 'tinker==0.36.0' && \
+    python3 -m pip install --index-url "$PPU_PIP_INDEX" 'uv==0.13.9' 'deepseek-recipe==0.2.0' 'tinker==0.36.0' 'typed-argument-parser==1.12.0' && \
     uv --version && \
-    python3 -c 'from tinker.types.topk_logprobs import MASK_LOGPROB'
+    python3 -c 'from tinker.types.topk_logprobs import MASK_LOGPROB; from tap import Tap'
 
 # Match the miles-ext-kernels submodule pinned by Miles v0.2.0.
 ARG MILES_EXT_KERNELS_COMMIT=34da9a8da93b5fe9c7b67d25582bbaf6ddb3653a
